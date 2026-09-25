@@ -1,0 +1,95 @@
+from datetime import datetime
+from enum import Enum
+
+from sqlalchemy import BigInteger, DateTime, Enum as SQLEnum
+from sqlalchemy import Index, Integer, Text
+from sqlalchemy.orm import Mapped, mapped_column
+
+from .base import Base
+
+
+class ScrapingStatus(str, Enum):
+    PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
+    SUCCESS = "SUCCESS"
+    UNPUBLISHED = "UNPUBLISHED"
+    FAILED_RETRY = "FAILED_RETRY"
+    FAILED_PERMANENT = "FAILED_PERMANENT"
+
+
+class Putusan(Base):
+    __tablename__ = "putusan"
+
+    __table_args__ = (
+            Index(
+                "ix_putusan_status_scraping",
+                "status_scraping",
+            ),
+        )
+    
+    id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        autoincrement=True,
+    )
+
+    tahun: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+    )
+
+    halaman: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    url_detail: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        unique=True,
+    )
+
+    url_pdf: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    judul: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    status_scraping: Mapped[ScrapingStatus] = mapped_column(
+        SQLEnum(ScrapingStatus),
+        nullable=False,
+        default=ScrapingStatus.PENDING,
+    )
+
+    retry_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    last_error: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+    )
+
+    last_scraped_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=datetime.utcnow,
+    )
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=datetime.utcnow,
+        onupdate=datetime.utcnow,
+    )
