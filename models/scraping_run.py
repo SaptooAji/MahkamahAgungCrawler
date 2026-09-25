@@ -7,6 +7,9 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
 
+class PaginationMode(str, Enum):
+    PREDICTIVE = "PREDICTIVE"
+    SEQUENTIAL = "SEQUENTIAL"
 
 class ScrapingRunStatus(str, Enum):
     PENDING = "PENDING"
@@ -85,4 +88,19 @@ class ScrapingRun(Base):
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    total_pages: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    pagination_mode: Mapped[PaginationMode | None] = mapped_column(
+        SQLEnum(PaginationMode),
+        nullable=True,
+    )
+
+    url_halaman_pertama: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
     )
