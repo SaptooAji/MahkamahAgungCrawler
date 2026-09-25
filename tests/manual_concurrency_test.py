@@ -5,6 +5,19 @@ from database.session import SessionLocal
 from models.putusan import Putusan, ScrapingStatus
 from repositories.putusan_repository import claim_pending_putusan
 
+TEST_URLS = [
+    "https://example.com/concurrency/1",
+    "https://example.com/concurrency/2",
+    "https://example.com/concurrency/3",
+    "https://example.com/concurrency/4",
+]
+
+def cleanup_test_data():
+    with SessionLocal.begin() as session:
+        session.query(Putusan).filter(
+            Putusan.url_detail.in_(TEST_URLS)
+        ).delete(synchronize_session=False)
+
 
 def seed_data():
     with SessionLocal.begin() as session:
@@ -48,6 +61,7 @@ def worker(name: str, barrier: threading.Barrier):
 
         putusan_list = claim_pending_putusan(
             session,
+            worker_id=name,
             batch_size=2,
         )
 
@@ -65,47 +79,52 @@ def worker(name: str, barrier: threading.Barrier):
 
 
 def main():
-    seed_data()
+    print("Cleaning previous concurrency test data...")
+    cleanup_test_data()
 
-    barrier = threading.Barrier(2)
+    try:
+        seed_data()
 
-    worker_a = threading.Thread(
-        target=worker,
-        args=("Worker A", barrier),
-    )
+        barrier = threading.Barrier(2)
 
-    worker_b = threading.Thread(
-        target=worker,
-        args=("Worker B", barrier),
-    )
-
-    worker_a.start()
-    worker_b.start()
-
-    worker_a.join()
-    worker_b.join()
-
-    print("\nFinal database state:")
-
-    with SessionLocal() as session:
-        rows = (
-            session.query(Putusan)
-            .filter(
-                Putusan.url_detail.like(
-                    "https://example.com/concurrency/%"
-                )
-            )
-            .order_by(Putusan.id)
-            .all()
+        worker_a = threading.Thread(
+            target=worker,
+            args=("Worker A", barrier),
         )
 
-        for row in rows:
-            print(
-                row.id,
-                row.url_detail,
-                row.status_scraping,
+        worker_b = threading.Thread(
+            target=worker,
+            args=("Worker B", barrier),
+        )
+
+        worker_a.start()
+        worker_b.start()
+
+        worker_a.join()
+        worker_b.join()
+
+        print("\nFinal database state:")
+
+        with SessionLocal() as session:
+            rows = (
+                session.query(Putusan)
+                .filter(
+                    Putusan.url_detail.like(
+                        "https://example.com/concurrency/%"
+                    )
+                )
+                .order_by(Putusan.id)
+                .all()
             )
 
+            for row in rows:
+                print(
+                    row.id,
+                    row.url_detail,
+                    row.status_scraping,
+                )
 
+    finally:
+        cleanup_test_data()
 if __name__ == "__main__":
     main()

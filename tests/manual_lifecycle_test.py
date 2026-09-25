@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from database.session import SessionLocal
 from models.putusan import Putusan, ScrapingStatus
 from repositories.putusan_repository import (
-    claim_pending_putusan,
+    claim_putusan_by_id,
     mark_putusan_success,
     mark_putusan_failed_retry,
     recover_stale_processing_putusan,
@@ -44,57 +44,71 @@ def create_pending(suffix: str):
 
 def test_success():
     cleanup_test_row("success")
-    putusan_id = create_pending("success")
 
+    putusan_id = create_pending("success")
     worker_id = "lifecycle-worker-01"
 
     with SessionLocal.begin() as session:
-        claimed = claim_pending_putusan(
+        claimed = claim_putusan_by_id(
             session,
+            putusan_id=putusan_id,
             worker_id=worker_id,
-            batch_size=1,
         )
 
-        assert len(claimed) == 1
-        assert claimed[0].id == putusan_id
-        assert claimed[0].status_scraping == ScrapingStatus.PROCESSING
+        assert claimed is not None
+        assert claimed.id == putusan_id
+        assert claimed.status_scraping == ScrapingStatus.PROCESSING
+
+        processing_token = claimed.processing_token
 
     with SessionLocal.begin() as session:
         putusan = mark_putusan_success(
             session,
             putusan_id=putusan_id,
             worker_id=worker_id,
+            processing_token=processing_token,
             url_pdf="https://example.com/pdf/1.pdf",
         )
 
         assert putusan.status_scraping == ScrapingStatus.SUCCESS
         assert putusan.processing_worker_id is None
         assert putusan.processing_started_at is None
+        assert putusan.processing_token is None
 
     print("SUCCESS lifecycle: PASS")
 
-
 def test_failed_retry():
     cleanup_test_row("retry")
-    putusan_id = create_pending("retry")
 
+    putusan_id = create_pending("retry")
     worker_id = "lifecycle-worker-02"
 
+    # ============================================================
+    # 1. Claim pertama
+    # ============================================================
     with SessionLocal.begin() as session:
-        claimed = claim_pending_putusan(
+        claimed = claim_putusan_by_id(
             session,
+            putusan_id=putusan_id,
             worker_id=worker_id,
-            batch_size=1,
         )
 
-        assert len(claimed) == 1
-        assert claimed[0].id == putusan_id
+        assert claimed is not None
+        assert claimed.id == putusan_id
+        assert claimed.status_scraping == ScrapingStatus.PROCESSING
 
+        processing_token = claimed.processing_token
+        assert processing_token is not None
+
+    # ============================================================
+    # 2. Worker gagal -> FAILED_RETRY
+    # ============================================================
     with SessionLocal.begin() as session:
         putusan = mark_putusan_failed_retry(
             session,
             putusan_id=putusan_id,
             worker_id=worker_id,
+            processing_token=processing_token,
             error_message="Simulated server error",
             retry_delay_seconds=300,
         )
@@ -103,66 +117,94 @@ def test_failed_retry():
         assert putusan.retry_count == 1
         assert putusan.next_retry_at is not None
 
-    # Belum waktunya retry.
+        # Ownership harus sudah dilepas
+        assert putusan.processing_worker_id is None
+        assert putusan.processing_started_at is None
+        assert putusan.processing_token is None
+
+    # ============================================================
+    # 3. Belum waktunya retry -> TIDAK BOLEH di-claim
+    # ============================================================
     with SessionLocal.begin() as session:
-        claimed = claim_pending_putusan(
+        claimed = claim_putusan_by_id(
             session,
+            putusan_id=putusan_id,
             worker_id="lifecycle-worker-03",
-            batch_size=1,
         )
 
-        assert len(claimed) == 0
+        assert claimed is None
 
-    # Simulasikan waktu retry sudah tiba.
+    # ============================================================
+    # 4. Simulasikan waktu retry sudah tiba
+    # ============================================================
     with SessionLocal.begin() as session:
         putusan = session.get(Putusan, putusan_id)
+
+        assert putusan is not None
+        assert putusan.status_scraping == ScrapingStatus.FAILED_RETRY
 
         putusan.next_retry_at = (
             datetime.now(timezone.utc)
             - timedelta(seconds=1)
         )
 
-    # Sekarang harus bisa di-claim kembali.
+    # ============================================================
+    # 5. Sekarang harus bisa di-claim kembali
+    # ============================================================
     with SessionLocal.begin() as session:
-        claimed = claim_pending_putusan(
+        claimed = claim_putusan_by_id(
             session,
+            putusan_id=putusan_id,
             worker_id="lifecycle-worker-03",
-            batch_size=1,
         )
 
-        assert len(claimed) == 1
-        assert claimed[0].id == putusan_id
-        assert claimed[0].status_scraping == ScrapingStatus.PROCESSING
+        assert claimed is not None
+        assert claimed.id == putusan_id
+        assert claimed.status_scraping == ScrapingStatus.PROCESSING
+
+        # Token harus berubah / dibuat untuk worker baru
+        new_processing_token = claimed.processing_token
+        assert new_processing_token is not None
+        assert new_processing_token != processing_token
 
     print("FAILED_RETRY lifecycle: PASS")
 
-
 def test_stale_processing_recovery():
     cleanup_test_row("stale")
-    putusan_id = create_pending("stale")
 
+    putusan_id = create_pending("stale")
     worker_id = "crashed-worker"
 
+    # ============================================================
+    # 1. Claim putusan
+    # ============================================================
     with SessionLocal.begin() as session:
-        claimed = claim_pending_putusan(
+        claimed = claim_putusan_by_id(
             session,
+            putusan_id=putusan_id,
             worker_id=worker_id,
-            batch_size=1,
         )
 
-        assert len(claimed) == 1
-        assert claimed[0].id == putusan_id
+        assert claimed is not None
+        assert claimed.id == putusan_id
+        assert claimed.status_scraping == ScrapingStatus.PROCESSING
 
-    # Simulasikan worker sudah crash selama > 30 menit.
+    # ============================================================
+    # 2. Simulasikan worker crash selama > 30 menit
+    # ============================================================
     with SessionLocal.begin() as session:
         putusan = session.get(Putusan, putusan_id)
+
+        assert putusan is not None
 
         putusan.processing_started_at = (
             datetime.now(timezone.utc)
             - timedelta(minutes=31)
         )
 
-    # Recovery.
+    # ============================================================
+    # 3. Recovery
+    # ============================================================
     with SessionLocal.begin() as session:
         recovered = recover_stale_processing_putusan(
             session,
@@ -171,18 +213,21 @@ def test_stale_processing_recovery():
 
         assert recovered == 1
 
-    # Pastikan sekarang menjadi FAILED_RETRY.
+    # ============================================================
+    # 4. Pastikan menjadi FAILED_RETRY
+    # ============================================================
     with SessionLocal() as session:
         putusan = session.get(Putusan, putusan_id)
 
+        assert putusan is not None
         assert putusan.status_scraping == ScrapingStatus.FAILED_RETRY
         assert putusan.processing_worker_id is None
         assert putusan.processing_started_at is None
+        assert putusan.processing_token is None
         assert putusan.next_retry_at is not None
 
     print("STALE PROCESSING recovery: PASS")
-
-
+    
 def main():
     print("Cleaning previous lifecycle test data...")
     cleanup()

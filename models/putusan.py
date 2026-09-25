@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from enum import Enum
+from uuid import uuid4
 
 from sqlalchemy import BigInteger, DateTime, Enum as SQLEnum
 from sqlalchemy import Index, Integer, Text
@@ -103,6 +104,8 @@ class Putusan(Base):
         Text,
         nullable=True,
     )
+
+    processing_token: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     next_retry_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),

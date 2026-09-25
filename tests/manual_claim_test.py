@@ -2,6 +2,21 @@ from database.session import SessionLocal
 from models.putusan import Putusan, ScrapingStatus
 from repositories.putusan_repository import claim_pending_putusan
 
+TEST_URLS = [
+    "https://example.com/putusan/1",
+    "https://example.com/putusan/2",
+    "https://example.com/putusan/3",
+    "https://example.com/putusan/4",
+    "https://example.com/putusan/5",
+]
+
+
+def cleanup_test_data():
+    with SessionLocal.begin() as session:
+        session.query(Putusan).filter(
+            Putusan.url_detail.in_(TEST_URLS)
+        ).delete(synchronize_session=False)
+
 
 def seed_data():
     with SessionLocal.begin() as session:
@@ -50,6 +65,7 @@ def claim_data():
     with SessionLocal.begin() as session:
         putusan_list = claim_pending_putusan(
             session,
+            worker_id="manual-worker-1",
             batch_size=2,
         )
 
@@ -63,6 +79,17 @@ def claim_data():
             )
 
 
+def main():
+    print("Cleaning previous claim test data...")
+    cleanup_test_data()
+
+    try:
+        seed_data()
+        claim_data()
+
+    finally:
+        cleanup_test_data()
+
+
 if __name__ == "__main__":
-    seed_data()
-    claim_data()
+    main()

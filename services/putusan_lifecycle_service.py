@@ -3,6 +3,7 @@ from sqlalchemy.orm import Session
 from models.putusan import Putusan
 from repositories.putusan_repository import (
     claim_pending_putusan,
+    claim_putusan_by_id,
     mark_putusan_failed_retry,
     mark_putusan_success,
     mark_putusan_unpublished,
@@ -37,12 +38,14 @@ class PutusanLifecycleService:
         *,
         putusan_id: int,
         worker_id: str,
+        processing_token: str,
         url_pdf: str | None = None,
     ) -> Putusan:
         return mark_putusan_success(
             session,
             putusan_id=putusan_id,
             worker_id=worker_id,
+            processing_token=processing_token,
             url_pdf=url_pdf,
         )
 
@@ -52,12 +55,14 @@ class PutusanLifecycleService:
         *,
         putusan_id: int,
         worker_id: str,
+        processing_token: str,
         error_message: str | None = None,
     ) -> Putusan:
         return mark_putusan_unpublished(
             session,
             putusan_id=putusan_id,
             worker_id=worker_id,
+            processing_token=processing_token,
             error_message=error_message,
         )
 
@@ -67,6 +72,7 @@ class PutusanLifecycleService:
         *,
         putusan_id: int,
         worker_id: str,
+        processing_token: str,
         error_message: str,
         retry_delay_seconds: int = 300,
     ) -> Putusan:
@@ -74,6 +80,7 @@ class PutusanLifecycleService:
             session,
             putusan_id=putusan_id,
             worker_id=worker_id,
+            processing_token=processing_token,
             error_message=error_message,
             retry_delay_seconds=retry_delay_seconds,
         )
@@ -87,6 +94,19 @@ class PutusanLifecycleService:
         return recover_stale_processing_putusan(
             session,
             lease_timeout_seconds=lease_timeout_seconds,
+        )
+
+    def claim_by_id(
+        self,
+        session: Session,
+        *,
+        putusan_id: int,
+        worker_id: str,
+    ) -> Putusan | None:
+        return claim_putusan_by_id(
+            session,
+            putusan_id=putusan_id,
+            worker_id=worker_id,
         )
 
 putusan_lifecycle_service = PutusanLifecycleService()

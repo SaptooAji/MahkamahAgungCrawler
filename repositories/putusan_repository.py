@@ -1,6 +1,7 @@
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone, timedelta
+from uuid import uuid4
 
 from models.putusan import Putusan, ScrapingStatus
 from sqlalchemy.dialects.postgresql import insert
@@ -39,6 +40,7 @@ def claim_pending_putusan(
         putusan.status_scraping = ScrapingStatus.PROCESSING
         putusan.processing_started_at = now
         putusan.processing_worker_id = worker_id
+        putusan.processing_token = str(uuid4())
         putusan.next_retry_at = None
 
     session.flush()
@@ -107,6 +109,7 @@ def mark_putusan_success(
     *,
     putusan_id: int,
     worker_id: str,
+    processing_token: str,
     url_pdf: str | None = None,
 ) -> Putusan:
     stmt = (
@@ -115,6 +118,7 @@ def mark_putusan_success(
             Putusan.id == putusan_id,
             Putusan.status_scraping == ScrapingStatus.PROCESSING,
             Putusan.processing_worker_id == worker_id,
+            Putusan.processing_token == processing_token,
         )
     )
 
@@ -132,6 +136,7 @@ def mark_putusan_success(
     putusan.last_scraped_at = datetime.now(timezone.utc)
     putusan.processing_started_at = None
     putusan.processing_worker_id = None
+    putusan.processing_token = None
     putusan.next_retry_at = None
 
     session.flush()
@@ -143,6 +148,7 @@ def mark_putusan_unpublished(
     *,
     putusan_id: int,
     worker_id: str,
+    processing_token: str,
     error_message: str | None = None,
 ) -> Putusan:
 
@@ -151,6 +157,7 @@ def mark_putusan_unpublished(
             Putusan.id == putusan_id,
             Putusan.status_scraping == ScrapingStatus.PROCESSING,
             Putusan.processing_worker_id == worker_id,
+            Putusan.processing_token == processing_token,
         )
     )
 
@@ -164,6 +171,7 @@ def mark_putusan_unpublished(
     putusan.last_error = error_message
     putusan.processing_started_at = None
     putusan.processing_worker_id = None
+    putusan.processing_token = None
     putusan.next_retry_at = None
 
     session.flush()
@@ -175,6 +183,7 @@ def mark_putusan_failed_retry(
     *,
     putusan_id: int,
     worker_id: str,
+    processing_token: str,
     error_message: str,
     retry_delay_seconds: int = 300,
 ) -> Putusan:
@@ -184,6 +193,7 @@ def mark_putusan_failed_retry(
             Putusan.id == putusan_id,
             Putusan.status_scraping == ScrapingStatus.PROCESSING,
             Putusan.processing_worker_id == worker_id,
+            Putusan.processing_token == processing_token,
         )
     )
 
@@ -200,6 +210,7 @@ def mark_putusan_failed_retry(
     putusan.last_error = error_message
     putusan.processing_started_at = None
     putusan.processing_worker_id = None
+    putusan.processing_token = None
     putusan.next_retry_at = (
         now + timedelta(seconds=retry_delay_seconds)
     )
@@ -241,8 +252,50 @@ def recover_stale_processing_putusan(
         )
         putusan.processing_started_at = None
         putusan.processing_worker_id = None
+        putusan.processing_token = None
         putusan.next_retry_at = datetime.now(timezone.utc)
 
     session.flush()
 
     return len(putusan_list)
+
+def claim_putusan_by_id(
+    session: Session,
+    *,
+    putusan_id: int,
+    worker_id: str,
+) -> Putusan | None:
+    now = datetime.now(timezone.utc)
+
+    stmt = (
+        select(Putusan)
+        .where(
+            Putusan.id == putusan_id,
+            Putusan.status_scraping.in_(
+                [
+                    ScrapingStatus.PENDING,
+                    ScrapingStatus.FAILED_RETRY,
+                ]
+            ),
+            (
+                Putusan.next_retry_at.is_(None)
+                | (Putusan.next_retry_at <= now)
+            ),
+        )
+        .with_for_update(skip_locked=True)
+    )
+
+    putusan = session.scalar(stmt)
+
+    if putusan is None:
+        return None
+
+    putusan.status_scraping = ScrapingStatus.PROCESSING
+    putusan.processing_started_at = now
+    putusan.processing_worker_id = worker_id
+    putusan.processing_token = str(uuid4())
+    putusan.next_retry_at = None
+
+    session.flush()
+
+    return putusan
