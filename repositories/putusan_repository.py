@@ -1,10 +1,12 @@
-from sqlalchemy import select
-from sqlalchemy.orm import Session
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 
-from models.putusan import Putusan, ScrapingStatus
+from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.orm import Session
+
+from models.putusan import Putusan, ScrapingStatus
+
 
 def claim_pending_putusan(
     session: Session,
@@ -12,7 +14,6 @@ def claim_pending_putusan(
     worker_id: str,
     batch_size: int = 10,
 ) -> list[Putusan]:
-
     now = datetime.now(timezone.utc)
 
     stmt = (
@@ -47,6 +48,7 @@ def claim_pending_putusan(
 
     return putusan_list
 
+
 def upsert_discovered_putusan(
     session: Session,
     *,
@@ -54,19 +56,13 @@ def upsert_discovered_putusan(
     halaman: int | None,
     url_detail: str,
     judul: str | None = None,
+    is_unpublish: bool = False,
 ) -> tuple[Putusan, bool]:
-    """
-    Insert putusan hasil discovery secara atomic.
-
-    Jika url_detail belum ada:
-        -> INSERT
-        -> return (Putusan, True)
-
-    Jika url_detail sudah ada:
-        -> tidak membuat row baru
-        -> tidak mengubah data existing
-        -> return (Putusan, False)
-    """
+    initial_status = (
+        ScrapingStatus.UNPUBLISHED
+        if is_unpublish
+        else ScrapingStatus.PENDING
+    )
 
     stmt = (
         insert(Putusan)
@@ -75,7 +71,7 @@ def upsert_discovered_putusan(
             halaman=halaman,
             url_detail=url_detail,
             judul=judul,
-            status_scraping=ScrapingStatus.PENDING,
+            status_scraping=initial_status,
         )
         .on_conflict_do_nothing(
             index_elements=[Putusan.url_detail]
@@ -89,6 +85,11 @@ def upsert_discovered_putusan(
     if inserted_id is not None:
         putusan = session.get(Putusan, inserted_id)
 
+        if putusan is None:
+            raise RuntimeError(
+                "Putusan berhasil dibuat tetapi tidak dapat dimuat kembali."
+            )
+
         return putusan, True
 
     putusan = session.scalar(
@@ -99,10 +100,43 @@ def upsert_discovered_putusan(
 
     if putusan is None:
         raise RuntimeError(
-            "Putusan tidak ditemukan setelah ON CONFLICT DO NOTHING"
+            "Putusan tidak ditemukan setelah ON CONFLICT DO NOTHING."
         )
 
+    # Discovery adalah sumber informasi terbaru mengenai
+    # apakah sebuah putusan sedang berstatus Unpublish.
+    #
+    # Kita hanya melakukan rekonsiliasi terhadap state yang
+    # aman diubah oleh discovery.
+    if is_unpublish:
+        if putusan.status_scraping in (
+            ScrapingStatus.PENDING,
+            ScrapingStatus.FAILED_RETRY,
+        ):
+            putusan.status_scraping = ScrapingStatus.UNPUBLISHED
+            putusan.next_retry_at = None
+            putusan.last_error = None
+
+    else:
+        # Jika sebelumnya UNPUBLISHED tetapi sekarang muncul
+        # sebagai putusan normal, izinkan diproses kembali.
+        if putusan.status_scraping == ScrapingStatus.UNPUBLISHED:
+            putusan.status_scraping = ScrapingStatus.PENDING
+            putusan.next_retry_at = None
+            putusan.last_error = None
+
+    # Judul/metadata discovery terbaru boleh diperbarui,
+    # tetapi jangan mengubah ownership processing.
+    if judul:
+        putusan.judul = judul
+
+    if halaman is not None:
+        putusan.halaman = halaman
+
+    session.flush()
+
     return putusan, False
+
 
 def mark_putusan_success(
     session: Session,
@@ -143,6 +177,7 @@ def mark_putusan_success(
 
     return putusan
 
+
 def mark_putusan_unpublished(
     session: Session,
     *,
@@ -151,7 +186,6 @@ def mark_putusan_unpublished(
     processing_token: str,
     error_message: str | None = None,
 ) -> Putusan:
-
     putusan = session.scalar(
         select(Putusan).where(
             Putusan.id == putusan_id,
@@ -178,6 +212,7 @@ def mark_putusan_unpublished(
 
     return putusan
 
+
 def mark_putusan_failed_retry(
     session: Session,
     *,
@@ -187,7 +222,6 @@ def mark_putusan_failed_retry(
     error_message: str,
     retry_delay_seconds: int = 300,
 ) -> Putusan:
-
     putusan = session.scalar(
         select(Putusan).where(
             Putusan.id == putusan_id,
@@ -219,14 +253,12 @@ def mark_putusan_failed_retry(
 
     return putusan
 
+
 def recover_stale_processing_putusan(
     session: Session,
     *,
     lease_timeout_seconds: int = 1800,
 ) -> int:
-
-    from datetime import timedelta
-
     cutoff = (
         datetime.now(timezone.utc)
         - timedelta(seconds=lease_timeout_seconds)
@@ -258,6 +290,7 @@ def recover_stale_processing_putusan(
     session.flush()
 
     return len(putusan_list)
+
 
 def claim_putusan_by_id(
     session: Session,

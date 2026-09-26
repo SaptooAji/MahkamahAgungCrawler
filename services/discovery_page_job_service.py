@@ -1,14 +1,67 @@
+from __future__ import annotations
+
 from sqlalchemy.orm import Session
 
 from repositories.discovery_page_job_repository import (
     claim_page_job_by_id,
-    mark_page_success,
+    create_page_jobs,
     mark_page_failed_retry,
+    mark_page_success,
     recover_stale_page_jobs,
 )
 
+from scraper.pagination import PageDescriptor
+
 
 class DiscoveryPageJobService:
+    """
+    Service untuk lifecycle DiscoveryPageJob.
+
+    Repository tetap menangani detail persistence.
+    Service menangani orchestration dan transformasi
+    dari object scraper ke format database.
+    """
+
+    def create_from_page_descriptors(
+        self,
+        session: Session,
+        *,
+        run_id: int,
+        tahun: int,
+        pages: list[PageDescriptor],
+    ) -> int:
+        """
+        Membuat discovery page jobs dari hasil pagination.
+
+        Operasi bersifat idempotent karena repository menggunakan:
+
+            ON CONFLICT DO NOTHING
+
+        sehingga menjalankan method ini dua kali tidak akan
+        membuat duplicate page jobs.
+
+        Return:
+            jumlah row baru yang benar-benar dibuat.
+        """
+
+        if not pages:
+            return 0
+
+        page_rows = [
+            {
+                "page_number": page.page_number,
+                "url_page": page.url_page,
+            }
+            for page in pages
+        ]
+
+        return create_page_jobs(
+            session,
+            run_id=run_id,
+            tahun=tahun,
+            pages=page_rows,
+        )
+
     def claim_by_id(
         self,
         session: Session,

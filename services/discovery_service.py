@@ -13,25 +13,20 @@ class DiscoveredPutusan:
     halaman: int | None
     url_detail: str
     judul: str | None = None
+    is_unpublish: bool = False
 
 
 def save_discovered_putusan(
     session: Session,
     data: DiscoveredPutusan,
 ) -> tuple[int, bool]:
-    """
-    Simpan hasil discovery ke database.
-
-    Returns:
-        (putusan_id, created)
-    """
-
     putusan, created = upsert_discovered_putusan(
         session,
         tahun=data.tahun,
         halaman=data.halaman,
         url_detail=data.url_detail,
         judul=data.judul,
+        is_unpublish=data.is_unpublish,
     )
 
     return putusan.id, created

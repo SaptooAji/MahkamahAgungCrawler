@@ -1,6 +1,7 @@
 from sqlalchemy.orm import Session
 
 from models.putusan import Putusan
+
 from repositories.putusan_repository import (
     claim_pending_putusan,
     claim_putusan_by_id,
@@ -8,6 +9,7 @@ from repositories.putusan_repository import (
     mark_putusan_success,
     mark_putusan_unpublished,
     recover_stale_processing_putusan,
+    upsert_discovered_putusan,
 )
 
 
@@ -108,5 +110,25 @@ class PutusanLifecycleService:
             putusan_id=putusan_id,
             worker_id=worker_id,
         )
+
+    def upsert_discovered(
+        self,
+        session: Session,
+        *,
+        tahun: int,
+        halaman: int | None,
+        url_detail: str,
+        judul: str | None = None,
+        is_unpublish: bool = False,
+    ) -> tuple[Putusan, bool]:
+        return upsert_discovered_putusan(
+            session,
+            tahun=tahun,
+            halaman=halaman,
+            url_detail=url_detail,
+            judul=judul,
+            is_unpublish=is_unpublish,
+        )
+
 
 putusan_lifecycle_service = PutusanLifecycleService()
