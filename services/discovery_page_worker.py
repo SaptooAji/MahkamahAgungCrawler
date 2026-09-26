@@ -27,22 +27,25 @@ class DiscoveryPageProcessResult:
     existing_count: int
     unpublish_count: int
 
+@dataclass(frozen=True, slots=True)
+class ClaimedDiscoveryPage:
+    page_job_id: int
+    processing_token: str
+    page_number: int
+    tahun: int
+    url_page: str
+
 
 class DiscoveryPageWorker:
     def __init__(self, scraper):
         self.scraper = scraper
 
-    async def process(
+    def claim(
         self,
-        browser,
         *,
         page_job_id: int,
         worker_id: str,
-    ) -> DiscoveryPageProcessResult:
-
-        # ---------------------------------------------------------
-        # 1. Claim page job
-        # ---------------------------------------------------------
+    ) -> ClaimedDiscoveryPage | None:
         with SessionLocal.begin() as session:
             page_job = discovery_page_job_service.claim_by_id(
                 session,
@@ -51,29 +54,34 @@ class DiscoveryPageWorker:
             )
 
             if page_job is None:
+                return None
+
+            if not page_job.processing_token:
                 raise RuntimeError(
-                    f"Discovery page job {page_job_id} "
-                    "tidak dapat di-claim."
+                    f"DiscoveryPageJob {page_job_id} "
+                    "berhasil di-claim tetapi processing_token kosong."
                 )
 
-            page_number = page_job.page_number
-            tahun = page_job.tahun
-            url_page = page_job.url_page
-            processing_token = page_job.processing_token
+            return ClaimedDiscoveryPage(
+                page_job_id=page_job.id,
+                processing_token=page_job.processing_token,
+                page_number=page_job.page_number,
+                tahun=page_job.tahun,
+                url_page=page_job.url_page,
+            )
 
-            if not processing_token:
-                raise RuntimeError(
-                    "Discovery page job berhasil di-claim "
-                    "tetapi processing_token kosong."
-                )
+    async def process_claimed(
+        self,
+        browser,
+        *,
+        claimed: ClaimedDiscoveryPage,
+        worker_id: str,
+    ) -> DiscoveryPageProcessResult:
 
-        # ---------------------------------------------------------
-        # 2. Scraping dilakukan DI LUAR transaction database
-        # ---------------------------------------------------------
         try:
             discovered = await self.scraper.scrape(
                 browser,
-                url_page=url_page,
+                url_page=claimed.url_page,
             )
 
             if discovered is None:
@@ -87,13 +95,9 @@ class DiscoveryPageWorker:
             for item in discovered:
                 if not isinstance(item, DiscoveredPagePutusan):
                     raise RuntimeError(
-                        "Discovery scraper mengembalikan object "
-                        "dengan tipe tidak sesuai."
+                        "Item discovery memiliki tipe yang tidak valid."
                     )
 
-            # -----------------------------------------------------
-            # 3. Persist hasil discovery
-            # -----------------------------------------------------
             created_count = 0
             existing_count = 0
             unpublish_count = 0
@@ -101,8 +105,8 @@ class DiscoveryPageWorker:
             with SessionLocal.begin() as session:
                 for item in discovered:
                     data = DiscoveredPutusanData(
-                        tahun=tahun,
-                        halaman=page_number,
+                        tahun=claimed.tahun,
+                        halaman=claimed.page_number,
                         url_detail=item.url_detail,
                         judul=item.judul,
                         is_unpublish=item.is_unpublish,
@@ -121,20 +125,17 @@ class DiscoveryPageWorker:
                     if item.is_unpublish:
                         unpublish_count += 1
 
-                # -------------------------------------------------
-                # 4. Tandai page job SUCCESS
-                # -------------------------------------------------
                 discovery_page_job_service.mark_success(
                     session,
-                    page_job_id=page_job_id,
+                    page_job_id=claimed.page_job_id,
                     worker_id=worker_id,
-                    processing_token=processing_token,
+                    processing_token=claimed.processing_token,
                     discovered_count=len(discovered),
                 )
 
             return DiscoveryPageProcessResult(
-                page_job_id=page_job_id,
-                page_number=page_number,
+                page_job_id=claimed.page_job_id,
+                page_number=claimed.page_number,
                 discovered_count=len(discovered),
                 created_count=created_count,
                 existing_count=existing_count,
@@ -142,21 +143,41 @@ class DiscoveryPageWorker:
             )
 
         except Exception as exc:
-            error_message = (
-                f"{type(exc).__name__}: {exc}"
-            )
+            error_message = f"{type(exc).__name__}: {exc}"
 
             with SessionLocal.begin() as session:
                 discovery_page_job_service.mark_failed_retry(
                     session,
-                    page_job_id=page_job_id,
+                    page_job_id=claimed.page_job_id,
                     worker_id=worker_id,
-                    processing_token=processing_token,
+                    processing_token=claimed.processing_token,
                     error_message=error_message,
                 )
 
             raise
 
+    async def process(
+        self,
+        browser,
+        *,
+        page_job_id: int,
+        worker_id: str,
+    ) -> DiscoveryPageProcessResult:
 
+        claimed = self.claim(
+            page_job_id=page_job_id,
+            worker_id=worker_id,
+        )
+
+        if claimed is None:
+            raise RuntimeError(
+                f"DiscoveryPageJob {page_job_id} tidak dapat di-claim."
+            )
+
+        return await self.process_claimed(
+            browser,
+            claimed=claimed,
+            worker_id=worker_id,
+        )
 def build_discovery_page_worker(scraper):
     return DiscoveryPageWorker(scraper)

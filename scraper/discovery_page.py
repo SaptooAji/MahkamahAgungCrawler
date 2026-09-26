@@ -1,10 +1,16 @@
-# scraper/discovery_page.py
 
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from enum import StrEnum
 from urllib.parse import urljoin
+
+
+class DiscoveryPageStatus(StrEnum):
+    SUCCESS = "SUCCESS"
+    EMPTY = "EMPTY"
+    RETRYABLE_ERROR = "RETRYABLE_ERROR"
 
 
 @dataclass(frozen=True)
@@ -14,15 +20,39 @@ class DiscoveredPutusan:
     is_unpublish: bool
 
 
+@dataclass(frozen=True)
+class DiscoveryPageSnapshot:
+    status: DiscoveryPageStatus
+    items: list[DiscoveredPutusan]
+    reason: str | None = None
+
+
 class DiscoveryPageScraper:
     DISCOVERY_JS = r"""
     (() => {
+        const bodyText = (
+            document.body?.innerText || ""
+        ).toLowerCase();
+
+        if (
+            bodyText.includes("500 - exception error") ||
+            bodyText.includes("terjadi kesalahan pada aplikasi")
+        ) {
+            return JSON.stringify({
+                status: "RETRYABLE_ERROR",
+                reason: "Server menampilkan error aplikasi."
+            });
+        }
+
         const mainWrapper =
             document.querySelector("#popular-post-list-sidebar") ||
             document.querySelector("#kolom-kiri");
 
         if (!mainWrapper) {
-            return JSON.stringify([]);
+            return JSON.stringify({
+                status: "RETRYABLE_ERROR",
+                reason: "Wrapper discovery belum ditemukan."
+            });
         }
 
         const PUTUSAN_SELECTOR =
@@ -98,7 +128,15 @@ class DiscoveryPageScraper:
             });
         });
 
-        return JSON.stringify(results);
+        return JSON.stringify({
+            status: results.length > 0
+                ? "SUCCESS"
+                : "EMPTY",
+            reason: results.length > 0
+                ? null
+                : "Wrapper ditemukan tetapi tidak ada link putusan.",
+            results: results
+        });
     })()
     """
 
@@ -106,33 +144,71 @@ class DiscoveryPageScraper:
         self,
         *,
         render_wait_seconds: float = 5.0,
+        retry_wait_seconds: float = 3.0,
+        max_attempts: int = 3,
     ):
         self.render_wait_seconds = render_wait_seconds
+        self.retry_wait_seconds = retry_wait_seconds
+        self.max_attempts = max_attempts
 
     async def extract_current_page(
         self,
         page,
         *,
         base_url: str | None = None,
-    ) -> list[DiscoveredPutusan]:
+    ) -> DiscoveryPageSnapshot:
 
-        raw = await page.evaluate(
-            self.DISCOVERY_JS
-        )
+        raw = await page.evaluate(self.DISCOVERY_JS)
 
         if not raw:
-            return []
+            raise RuntimeError(
+                "JavaScript discovery tidak mengembalikan hasil."
+            )
 
         try:
-            rows = json.loads(raw)
+            payload = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise RuntimeError(
                 "Hasil JavaScript discovery bukan JSON valid."
             ) from exc
 
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                "Hasil JavaScript discovery harus berupa object."
+            )
+
+        status = payload.get("status")
+
+        if status == "RETRYABLE_ERROR":
+            return DiscoveryPageSnapshot(
+                status=DiscoveryPageStatus.RETRYABLE_ERROR,
+                items=[],
+                reason=str(
+                    payload.get("reason")
+                    or "Alasan retry tidak diketahui."
+                ),
+            )
+
+        if status == "EMPTY":
+            return DiscoveryPageSnapshot(
+                status=DiscoveryPageStatus.EMPTY,
+                items=[],
+                reason=str(
+                    payload.get("reason")
+                    or "Tidak ada putusan ditemukan."
+                ),
+            )
+
+        if status != "SUCCESS":
+            raise RuntimeError(
+                f"Status discovery tidak dikenal: {status!r}"
+            )
+
+        rows = payload.get("results")
+
         if not isinstance(rows, list):
             raise RuntimeError(
-                "Hasil JavaScript discovery harus berupa list."
+                "Field 'results' dari discovery harus berupa list."
             )
 
         results: list[DiscoveredPutusan] = []
@@ -168,7 +244,10 @@ class DiscoveryPageScraper:
                 )
             )
 
-        return results
+        return DiscoveryPageSnapshot(
+            status=DiscoveryPageStatus.SUCCESS,
+            items=results,
+        )
 
     async def scrape(
         self,
@@ -179,12 +258,43 @@ class DiscoveryPageScraper:
 
         page = await browser.get(url_page)
 
-        # Cloudflare/render wait yang sudah tervalidasi.
-        await page.sleep(
-            self.render_wait_seconds
-        )
+        for attempt in range(1, self.max_attempts + 1):
+            await page.sleep(
+                self.render_wait_seconds
+            )
 
-        return await self.extract_current_page(
-            page,
-            base_url=url_page,
+            snapshot = await self.extract_current_page(
+                page,
+                base_url=url_page,
+            )
+
+            if (
+                snapshot.status
+                == DiscoveryPageStatus.SUCCESS
+            ):
+                return snapshot.items
+
+            if (
+                snapshot.status
+                == DiscoveryPageStatus.EMPTY
+            ):
+                # Wrapper ada dan halaman valid, tetapi
+                # memang tidak ditemukan putusan.
+                return []
+
+            # RETRYABLE_ERROR
+            if attempt < self.max_attempts:
+                await page.sleep(
+                    self.retry_wait_seconds
+                )
+                continue
+
+            raise RuntimeError(
+                "Discovery page tidak siap setelah "
+                f"{self.max_attempts} percobaan: "
+                f"{snapshot.reason}"
+            )
+
+        raise RuntimeError(
+            "Discovery page gagal diproses."
         )

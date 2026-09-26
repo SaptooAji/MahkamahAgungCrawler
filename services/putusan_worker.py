@@ -5,10 +5,16 @@ from dataclasses import dataclass
 from database.session import SessionLocal
 from scraper.detail_page import (
     DetailPageScraper,
-    DetailScrapeResult,
     DetailScrapeStatus,
 )
 from services.putusan_lifecycle_service import putusan_lifecycle_service
+
+
+@dataclass(frozen=True, slots=True)
+class ClaimedPutusan:
+    putusan_id: int
+    url_detail: str
+    processing_token: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,13 +30,15 @@ class PutusanWorker:
     """
     Orchestrator untuk memproses satu Putusan.
 
-    Alur:
+    Lifecycle:
 
         claim DB
           ↓
         commit
           ↓
-        scrape browser
+        start/use browser
+          ↓
+        scrape
           ↓
         update DB menggunakan processing_token
           ↓
@@ -45,17 +53,21 @@ class PutusanWorker:
     ) -> None:
         self.scraper = scraper
 
-    async def process(
+    def claim(
         self,
-        browser,
         *,
         putusan_id: int,
         worker_id: str,
-    ) -> PutusanProcessResult:
-        # ============================================================
-        # 1. CLAIM
-        # ============================================================
+    ) -> ClaimedPutusan | None:
+        """
+        Claim satu Putusan secara atomik.
 
+        Tidak membuka browser.
+
+        Return:
+            ClaimedPutusan jika berhasil di-claim.
+            None jika row tidak dapat di-claim.
+        """
         with SessionLocal.begin() as session:
             putusan = putusan_lifecycle_service.claim_by_id(
                 session,
@@ -64,13 +76,8 @@ class PutusanWorker:
             )
 
             if putusan is None:
-                raise RuntimeError(
-                    f"Putusan ID {putusan_id} tidak dapat di-claim. "
-                    "Kemungkinan sudah diproses worker lain, "
-                    "belum waktunya retry, atau status tidak valid."
-                )
+                return None
 
-            url_detail = putusan.url_detail
             processing_token = putusan.processing_token
 
             if not processing_token:
@@ -79,22 +86,37 @@ class PutusanWorker:
                     "tetapi processing_token kosong."
                 )
 
-        # ============================================================
-        # 2. SCRAPE DETAIL
-        #
-        # Transaksi DB SUDAH selesai pada tahap ini.
-        # ============================================================
+            return ClaimedPutusan(
+                putusan_id=putusan.id,
+                url_detail=putusan.url_detail,
+                processing_token=processing_token,
+            )
 
+    async def process_claimed(
+        self,
+        browser,
+        *,
+        claimed: ClaimedPutusan,
+        worker_id: str,
+    ) -> PutusanProcessResult:
+        """
+        Memproses Putusan yang SUDAH di-claim.
+
+        Browser sudah tersedia ketika method ini dipanggil.
+        """
+
+        putusan_id = claimed.putusan_id
+        url_detail = claimed.url_detail
+        processing_token = claimed.processing_token
+
+        # SCRAPE
         try:
             result = await self.scraper.scrape(
                 browser,
                 url_detail=url_detail,
             )
-
         except Exception as exc:
-            error_message = (
-                f"{type(exc).__name__}: {exc}"
-            )
+            error_message = f"{type(exc).__name__}: {exc}"
 
             with SessionLocal.begin() as session:
                 putusan_lifecycle_service.mark_failed_retry(
@@ -107,10 +129,7 @@ class PutusanWorker:
 
             raise
 
-        # ============================================================
-        # 3. UPDATE DATABASE
-        # ============================================================
-
+        # SUCCESS
         if result.status == DetailScrapeStatus.SUCCESS:
             with SessionLocal.begin() as session:
                 putusan_lifecycle_service.mark_success(
@@ -128,6 +147,7 @@ class PutusanWorker:
                 url_pdf=result.url_pdf,
             )
 
+        # UNPUBLISHED
         if result.status == DetailScrapeStatus.UNPUBLISHED:
             with SessionLocal.begin() as session:
                 putusan_lifecycle_service.mark_unpublished(
@@ -145,13 +165,15 @@ class PutusanWorker:
                 error_message=result.error_message,
             )
 
+        # RETRYABLE / PDF_NOT_FOUND
         if result.status in (
             DetailScrapeStatus.RETRYABLE_ERROR,
             DetailScrapeStatus.PDF_NOT_FOUND,
         ):
             error_message = (
                 result.error_message
-                or f"Detail scraper menghasilkan status {result.status.value}."
+                or f"Detail scraper menghasilkan status "
+                f"{result.status.value}."
             )
 
             with SessionLocal.begin() as session:
@@ -172,6 +194,48 @@ class PutusanWorker:
 
         raise RuntimeError(
             f"Status hasil detail tidak ditangani: {result.status}"
+        )
+
+    async def process(
+        self,
+        browser,
+        *,
+        putusan_id: int,
+        worker_id: str,
+    ) -> PutusanProcessResult:
+        """
+        Backward-compatible convenience method.
+
+        Method ini tetap melakukan claim lalu scrape menggunakan browser
+        yang diberikan caller.
+
+        Untuk Celery production flow, gunakan:
+            claim()
+            lalu start browser
+            lalu process_claimed()
+        """
+
+        claimed = self.claim(
+            putusan_id=putusan_id,
+            worker_id=worker_id,
+        )
+
+        if claimed is None:
+            return PutusanProcessResult(
+                putusan_id=putusan_id,
+                status="SKIPPED",
+                url_detail="",
+                error_message=(
+                    "Putusan tidak dapat di-claim. "
+                    "Kemungkinan sudah diproses worker lain, "
+                    "belum waktunya retry, atau status tidak valid."
+                ),
+            )
+
+        return await self.process_claimed(
+            browser,
+            claimed=claimed,
+            worker_id=worker_id,
         )
 
 
