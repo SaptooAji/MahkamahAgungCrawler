@@ -10,6 +10,7 @@ from repositories.putusan_repository import (
 
 @dataclass(slots=True)
 class DiscoveredPutusan:
+    run_id: int | None
     tahun: int
     halaman: int | None
     url_detail: str
@@ -25,6 +26,7 @@ def save_discovered_putusan(
 
     putusan, created = upsert_discovered_putusan(
         session,
+        run_id=data.run_id,
         tahun=data.tahun,
         halaman=data.halaman,
         url_detail=canonical_url,

@@ -145,13 +145,298 @@ def process_putusan(
 
 
 # ============================================================
-# DISCOVERY PAGE PROCESS
+# DISCOVERY PAGE BATCH PROCESS
 # ============================================================
+
+DISCOVERY_BATCH_SIZE_MAX = 5
+
+
+async def _process_discovery_page_batch(
+    page_job_ids: list[int],
+    worker_id: str,
+) -> dict:
+    """
+    Memproses satu batch DiscoveryPageJob secara sequential.
+
+    Invariant:
+    - maksimal 5 job per batch;
+    - claim dilakukan sebelum browser dimulai;
+    - satu batch menggunakan satu browser;
+    - kegagalan satu job tidak menghentikan job berikutnya.
+
+    Lifecycle status job tetap menjadi tanggung jawab
+    DiscoveryPageWorker melalui process_claimed().
+    """
+
+    if not page_job_ids:
+        return {
+            "requested": 0,
+            "claimed": 0,
+            "processed": 0,
+            "success": 0,
+            "failed": 0,
+            "skipped": 0,
+            "results": [],
+            "next_batch_scheduled": False,
+            "next_task_id": None,
+        }
+
+    if len(page_job_ids) > DISCOVERY_BATCH_SIZE_MAX:
+        raise ValueError(
+            "Jumlah page_job_ids dalam satu batch tidak boleh lebih dari 5."
+        )
+
+    scraper = DiscoveryPageScraper(
+        render_wait_seconds=5.0,
+    )
+
+    worker = build_discovery_page_worker(scraper)
+
+    # ------------------------------------------------------------
+    # 1. CLAIM SEMUA JOB DULU
+    # ------------------------------------------------------------
+    claimed_jobs = []
+    skipped_ids = []
+
+    for page_job_id in page_job_ids:
+        claimed = worker.claim(
+            page_job_id=page_job_id,
+            worker_id=worker_id,
+        )
+
+        if claimed is None:
+            skipped_ids.append(page_job_id)
+            continue
+
+        claimed_jobs.append(claimed)
+
+    # Tidak ada job yang berhasil di-claim.
+    if not claimed_jobs:
+        return {
+            "requested": len(page_job_ids),
+            "claimed": 0,
+            "processed": 0,
+            "success": 0,
+            "failed": 0,
+            "skipped": len(skipped_ids),
+            "results": [
+                {
+                    "page_job_id": page_job_id,
+                    "status": "SKIPPED",
+                }
+                for page_job_id in skipped_ids
+            ],
+            "next_batch_scheduled": False,
+            "next_task_id": None,
+        }
+
+    # ------------------------------------------------------------
+    # 2. BARU START SATU BROWSER
+    # ------------------------------------------------------------
+    browser = await uc.start(
+        headless=False,
+        browser_args=[
+            "--start-maximized",
+            "--disable-dev-shm-usage",
+            "--mute-audio",
+        ],
+    )
+
+    results = [
+        {
+            "page_job_id": page_job_id,
+            "status": "SKIPPED",
+        }
+        for page_job_id in skipped_ids
+    ]
+
+    success_count = 0
+    failed_count = 0
+
+    try:
+        # --------------------------------------------------------
+        # 3. PROCESS SEQUENTIAL DALAM SATU BROWSER
+        # --------------------------------------------------------
+        for claimed in claimed_jobs:
+            try:
+                result = await worker.process_claimed(
+                    browser,
+                    claimed=claimed,
+                    worker_id=worker_id,
+                )
+
+                results.append({
+                    **asdict(result),
+                    "status": "SUCCESS",
+                })
+                success_count += 1
+
+            except Exception as exc:
+                # process_claimed() sudah bertanggung jawab menandai
+                # job FAILED_RETRY sebelum exception dilempar kembali.
+                results.append({
+                    "page_job_id": claimed.page_job_id,
+                    "page_number": claimed.page_number,
+                    "status": "FAILED_RETRY",
+                    "error_message": (
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                })
+                failed_count += 1
+
+        return {
+            "requested": len(page_job_ids),
+            "claimed": len(claimed_jobs),
+            "processed": len(claimed_jobs),
+            "success": success_count,
+            "failed": failed_count,
+            "skipped": len(skipped_ids),
+            "results": results,
+        }
+
+    finally:
+        browser.stop()
+
+
+@celery_app.task(
+    bind=True,
+    name="discovery_page.dispatch_pending",
+)
+def dispatch_pending_discovery_page(
+    self,
+    batch_size: int = DISCOVERY_BATCH_SIZE_MAX,
+) -> dict:
+    """
+    Memulai satu batch DiscoveryPageJob.
+
+    Dispatcher hanya memilih ID yang siap diproses.
+    Claim tetap dilakukan oleh batch worker setelah task dimulai.
+    """
+
+    if batch_size < 1:
+        raise ValueError("batch_size harus >= 1")
+
+    if batch_size > DISCOVERY_BATCH_SIZE_MAX:
+        raise ValueError(
+            "batch_size maksimal 5 untuk konfigurasi worker saat ini."
+        )
+
+    page_job_ids = get_pending_discovery_page_ids(
+        batch_size=batch_size,
+    )
+
+    if not page_job_ids:
+        return {
+            "dispatched": 0,
+            "page_job_ids": [],
+            "task_id": None,
+        }
+
+    result = process_discovery_page_batch.delay(
+        page_job_ids,
+    )
+
+    return {
+        "dispatched": len(page_job_ids),
+        "page_job_ids": page_job_ids,
+        "task_id": result.id,
+    }
+
+
+@celery_app.task(
+    bind=True,
+    name="discovery_page.process_batch",
+)
+def process_discovery_page_batch(
+    self,
+    page_job_ids: list[int],
+) -> dict:
+    """
+    Celery entry point untuk satu batch.
+
+    Setelah batch selesai, satu batch berikutnya dijadwalkan
+    otomatis jika masih ada DiscoveryPageJob yang pending.
+    """
+
+    if not page_job_ids:
+        return {
+            "requested": 0,
+            "claimed": 0,
+            "processed": 0,
+            "success": 0,
+            "failed": 0,
+            "skipped": 0,
+            "results": [],
+            "next_batch_scheduled": False,
+            "next_task_id": None,
+        }
+
+    if len(page_job_ids) > DISCOVERY_BATCH_SIZE_MAX:
+        raise ValueError(
+            "Satu batch maksimal berisi 5 DiscoveryPageJob."
+        )
+
+    worker_id = get_worker_id()
+
+    result = asyncio.run(
+        _process_discovery_page_batch(
+            page_job_ids,
+            worker_id,
+        )
+    )
+
+    # ------------------------------------------------------------
+    # AUTOMATIC NEXT BATCH
+    # ------------------------------------------------------------
+    next_page_job_ids = get_pending_discovery_page_ids(
+        batch_size=DISCOVERY_BATCH_SIZE_MAX,
+    )
+
+    if next_page_job_ids:
+        next_task = process_discovery_page_batch.delay(
+            next_page_job_ids,
+        )
+
+        result["next_batch_scheduled"] = True
+        result["next_task_id"] = next_task.id
+    else:
+        result["next_batch_scheduled"] = False
+        result["next_task_id"] = None
+
+    return result
+
+
+@celery_app.task(
+    bind=True,
+    name="discovery_page.process",
+)
+def process_discovery_page(
+    self,
+    page_job_id: int,
+) -> dict:
+    """
+    Manual/recovery path untuk satu DiscoveryPageJob.
+
+    Path ini sengaja dipertahankan untuk debugging dan recovery.
+    Jalur normal Phase 5 menggunakan process_discovery_page_batch.
+    """
+
+    worker_id = get_worker_id()
+
+    return asyncio.run(
+        _process_discovery_page(
+            page_job_id,
+            worker_id,
+        )
+    )
+
 
 async def _process_discovery_page(
     page_job_id: int,
     worker_id: str,
 ) -> dict:
+    """Single-job compatibility/recovery path."""
+
     scraper = DiscoveryPageScraper(
         render_wait_seconds=5.0,
     )
@@ -199,52 +484,3 @@ async def _process_discovery_page(
 
     finally:
         browser.stop()
-
-@celery_app.task(
-    bind=True,
-    name="discovery_page.dispatch_pending",
-)
-def dispatch_pending_discovery_page(
-    self,
-    batch_size: int = 5,
-) -> dict:
-    if batch_size < 1:
-        raise ValueError("batch_size harus >= 1")
-
-    if batch_size > 5:
-        raise ValueError(
-            "batch_size maksimal 5 untuk menjaga batas concurrency."
-        )
-
-    page_job_ids = get_pending_discovery_page_ids(
-        batch_size=batch_size,
-    )
-
-    task_ids = []
-
-    for page_job_id in page_job_ids:
-        result = process_discovery_page.delay(page_job_id)
-        task_ids.append(result.id)
-
-    return {
-        "dispatched": len(page_job_ids),
-        "page_job_ids": page_job_ids,
-        "task_ids": task_ids,
-    }
-
-@celery_app.task(
-    bind=True,
-    name="discovery_page.process",
-)
-def process_discovery_page(
-    self,
-    page_job_id: int,
-) -> dict:
-    worker_id = get_worker_id()
-
-    return asyncio.run(
-        _process_discovery_page(
-            page_job_id,
-            worker_id,
-        )
-    )

@@ -10,6 +10,7 @@ class DetailScrapeStatus(str, Enum):
     SUCCESS = "SUCCESS"
     UNPUBLISHED = "UNPUBLISHED"
     RETRYABLE_ERROR = "RETRYABLE_ERROR"
+    CLOUDFLARE_CHALLENGE = "CLOUDFLARE_CHALLENGE"
     PDF_NOT_FOUND = "PDF_NOT_FOUND"
 
 
@@ -44,107 +45,209 @@ class DetailPageScraper:
     """
 
     DETAIL_JS = r"""
-    (() => {
-        const bodyText = (document.body?.innerText || "").trim();
-        const bodyTextLower = bodyText.toLowerCase();
+        (() => {
+            const bodyText = (document.body?.innerText || "").trim();
+            const bodyTextLower = bodyText.toLowerCase();
+            const title = (document.title || "").trim();
+            const titleLower = title.toLowerCase();
 
-        /*
-         * 1. Server error Mahkamah Agung
-         */
-        const isServerError =
-            bodyTextLower.includes("500 - exception error") ||
-            bodyTextLower.includes(
-                "terjadi kesalahan pada aplikasi"
+            /*
+            * 1. Cloudflare challenge
+            *
+            * Cloudflare challenge bukan Python exception.
+            * Browser tetap berhasil membuka halaman, tetapi DOM yang
+            * tersedia bukan halaman detail putusan.
+            */
+            const cloudflareSelectors = [
+                "#challenge-running",
+                "#challenge-stage",
+                ".cf-chl-widget",
+                "[name='cf-turnstile-response']",
+                "iframe[src*='challenges.cloudflare.com']"
+            ];
+
+            const cloudflareMatchedSelectors =
+                cloudflareSelectors.filter(
+                    (selector) =>
+                        document.querySelector(selector) !== null
+                );
+
+            const cloudflareTexts = [
+                "just a moment",
+                "performing security verification",
+                "verify you are human",
+                "checking your browser",
+                "checking if the site connection is secure",
+                "enable javascript and cookies to continue"
+            ];
+
+            const cloudflareMatchedTexts =
+                cloudflareTexts.filter(
+                    (text) =>
+                        titleLower.includes(text) ||
+                        bodyTextLower.includes(text)
+                );
+
+            const isCloudflare =
+                cloudflareMatchedSelectors.length > 0 ||
+                cloudflareMatchedTexts.length > 0;
+
+            if (isCloudflare) {
+                return JSON.stringify({
+                    status: "CLOUDFLARE_CHALLENGE",
+                    cloudflare: {
+                        title: title,
+                        matched_selectors:
+                            cloudflareMatchedSelectors,
+                        matched_texts:
+                            cloudflareMatchedTexts
+                    }
+                });
+            }
+
+            /*
+            * 2. Server error Mahkamah Agung
+            */
+            const isServerError =
+                bodyTextLower.includes("500 - exception error") ||
+                bodyTextLower.includes(
+                    "terjadi kesalahan pada aplikasi"
+                );
+
+            if (isServerError) {
+                return JSON.stringify({
+                    status: "RETRYABLE_ERROR",
+                    error_message:
+                        "500 - Exception Error / " +
+                        "terjadi kesalahan pada aplikasi"
+                });
+            }
+
+            /*
+            * 3. Cari link PDF.
+            *
+            * URL PDF Mahkamah Agung tidak selalu berakhiran .pdf.
+            * Struktur yang digunakan:
+            *
+            * /direktori/download_file/.../pdf/...
+            */
+            const pdfLinks = Array.from(
+                document.querySelectorAll(
+                    'a[href*="/direktori/download_file/"][href*="/pdf/"]'
+                )
             );
 
-        if (isServerError) {
+            const pdfCandidates = pdfLinks.map((a) => ({
+                href: a.href || a.getAttribute("href"),
+                text: (
+                    a.innerText ||
+                    a.textContent ||
+                    ""
+                ).trim()
+            }));
+
+            /*
+            * 4. Unpublish
+            *
+            * Berdasarkan struktur HTML aktual halaman Mahkamah Agung:
+            *
+            * <section id="content">
+            *     ...
+            *     <p>
+            *         Putusan ini tidak dipublikasikan ...
+            *     </p>
+            * </section>
+            *
+            * Kita tidak menggunakan keyword generik seperti:
+            *   - "unpublish"
+            *   - "belum dipublikasikan"
+            *   - "tidak tersedia"
+            *
+            * Detector menggunakan struktur DOM #content dan frasa
+            * inti yang spesifik terhadap halaman Unpublish.
+            *
+            * PDF juga harus tidak ditemukan agar halaman tidak salah
+            * diklasifikasikan sebagai UNPUBLISHED jika suatu saat
+            * halaman mengandung teks tersebut tetapi tetap menyediakan PDF.
+            */
+            const content = document.querySelector("#content");
+
+            const unpublishedParagraphs = Array.from(
+                content?.querySelectorAll("p") || []
+            ).map(
+                (p) =>
+                    (p.innerText || "")
+                        .trim()
+                        .toLowerCase()
+            );
+
+            const unpublishedMatchedParagraphs =
+                unpublishedParagraphs.filter(
+                    (text) =>
+                        text.includes(
+                            "putusan ini tidak dipublikasikan"
+                        )
+                );
+
+            const isUnpublished =
+                unpublishedMatchedParagraphs.length > 0;
+
+            /*
+            * 5. Unpublish tanpa PDF
+            */
+            if (
+                isUnpublished &&
+                pdfCandidates.length === 0
+            ) {
+                return JSON.stringify({
+                    status: "UNPUBLISHED",
+                    reason:
+                        "putusan_tidak_dipublikasikan",
+                    diagnostics: {
+                        matched_paragraphs:
+                            unpublishedMatchedParagraphs,
+                        pdf_count:
+                            pdfCandidates.length
+                    },
+                    pdf_candidates: []
+                });
+            }
+
+            /*
+            * 6. PDF ditemukan
+            */
+            const pdfCandidate =
+                pdfCandidates.find((item) =>
+                    item.text
+                        .toLowerCase()
+                        .includes(".pdf")
+                ) ||
+                pdfCandidates[0] ||
+                null;
+
+            if (
+                pdfCandidate &&
+                pdfCandidate.href
+            ) {
+                return JSON.stringify({
+                    status: "SUCCESS",
+                    pdf_candidates: pdfCandidates,
+                    selected_pdf: pdfCandidate
+                });
+            }
+
+            /*
+            * 7. Belum ada PDF.
+            *
+            * Jangan langsung menganggap halaman gagal.
+            * Python akan melakukan waiting berikutnya.
+            */
             return JSON.stringify({
-                status: "RETRYABLE_ERROR",
-                error_message:
-                    "500 - Exception Error / " +
-                    "terjadi kesalahan pada aplikasi"
-            });
-        }
-
-        /*
-         * 2. Unpublish
-         */
-        const isUnpublished =
-            bodyTextLower.includes("unpublish") ||
-            bodyTextLower.includes("belum dipublikasikan");
-
-        /*
-         * 3. Cari link PDF.
-         *
-         * URL PDF Mahkamah Agung tidak selalu berakhiran .pdf.
-         * Struktur yang digunakan:
-         *
-         * /direktori/download_file/.../pdf/...
-         */
-        const pdfLinks = Array.from(
-            document.querySelectorAll(
-                'a[href*="/direktori/download_file/"][href*="/pdf/"]'
-            )
-        );
-
-        const pdfCandidates = pdfLinks.map((a) => ({
-            href: a.href || a.getAttribute("href"),
-            text: (
-                a.innerText ||
-                a.textContent ||
-                ""
-            ).trim()
-        }));
-
-        /*
-         * 4. Unpublish tanpa PDF
-         */
-        if (
-            isUnpublished &&
-            pdfCandidates.length === 0
-        ) {
-            return JSON.stringify({
-                status: "UNPUBLISHED",
+                status: "PDF_NOT_FOUND",
                 pdf_candidates: []
             });
-        }
-
-        /*
-         * 5. PDF ditemukan
-         */
-        const pdfCandidate =
-            pdfCandidates.find((item) =>
-                item.text
-                    .toLowerCase()
-                    .includes(".pdf")
-            ) ||
-            pdfCandidates[0] ||
-            null;
-
-        if (
-            pdfCandidate &&
-            pdfCandidate.href
-        ) {
-            return JSON.stringify({
-                status: "SUCCESS",
-                pdf_candidates: pdfCandidates,
-                selected_pdf: pdfCandidate
-            });
-        }
-
-        /*
-         * 6. Belum ada PDF.
-         *
-         * Jangan langsung menganggap halaman gagal.
-         * Python akan melakukan waiting berikutnya.
-         */
-        return JSON.stringify({
-            status: "PDF_NOT_FOUND",
-            pdf_candidates: []
-        });
-    })()
+        })()
     """
-
     def __init__(
         self,
         *,
@@ -218,6 +321,24 @@ class DetailPageScraper:
             raise RuntimeError(
                 f"Status detail tidak dikenal: {status_raw!r}"
             ) from exc
+
+        if status == DetailScrapeStatus.CLOUDFLARE_CHALLENGE:
+            cloudflare = data.get("cloudflare") or {}
+
+            title = str(cloudflare.get("title") or "").strip()
+            matched_selectors = cloudflare.get("matched_selectors") or []
+            matched_texts = cloudflare.get("matched_texts") or []
+
+            return DetailScrapeResult(
+                status=status,
+                url_detail=url_detail,
+                error_message=(
+                    "Cloudflare challenge detected. "
+                    f"title={title!r}; "
+                    f"selectors={matched_selectors}; "
+                    f"texts={matched_texts}"
+                ),
+            )
 
         if status == DetailScrapeStatus.RETRYABLE_ERROR:
             return DetailScrapeResult(
@@ -327,6 +448,23 @@ class DetailPageScraper:
             ):
                 return result
 
+            if result.status == DetailScrapeStatus.CLOUDFLARE_CHALLENGE:
+                print(
+                    "[DETAIL] Cloudflare challenge detected. "
+                    f"{result.error_message}"
+                )
+
+                if elapsed >= self.max_wait_seconds:
+                    return DetailScrapeResult(
+                        status=DetailScrapeStatus.RETRYABLE_ERROR,
+                        url_detail=url_detail,
+                        error_message=(
+                            "Cloudflare challenge tidak terlewati "
+                            f"setelah {elapsed:.1f} detik. "
+                            f"{result.error_message}"
+                        ),
+                    )
+
             '''/*
              * PDF_NOT_FOUND:
              * halaman mungkin belum selesai render.
@@ -359,11 +497,18 @@ class DetailPageScraper:
                 remaining,
             )
 
-            print(
-                "[DETAIL] "
-                f"PDF belum ditemukan. "
-                f"Menunggu {wait_seconds:.1f}s lagi..."
-            )
+            if result.status == DetailScrapeStatus.CLOUDFLARE_CHALLENGE:
+                print(
+                    "[DETAIL] "
+                    "Cloudflare masih aktif. "
+                    f"Menunggu {wait_seconds:.1f}s lagi..."
+                )
+            else:
+                print(
+                    "[DETAIL] "
+                    f"PDF belum ditemukan. "
+                    f"Menunggu {wait_seconds:.1f}s lagi..."
+                )
 
             await page.sleep(
                 wait_seconds

@@ -52,6 +52,7 @@ def claim_pending_putusan(
 def upsert_discovered_putusan(
     session: Session,
     *,
+    run_id: int | None = None,
     tahun: int,
     halaman: int | None,
     url_detail: str,
@@ -67,6 +68,7 @@ def upsert_discovered_putusan(
     stmt = (
         insert(Putusan)
         .values(
+            run_id=run_id,
             tahun=tahun,
             halaman=halaman,
             url_detail=url_detail,
@@ -102,6 +104,11 @@ def upsert_discovered_putusan(
         raise RuntimeError(
             "Putusan tidak ditemukan setelah ON CONFLICT DO NOTHING."
         )
+
+    # Jangan mengambil alih Putusan yang sudah dimiliki run lain.
+    # Run baru hanya boleh mengisi run_id jika sebelumnya belum ada.
+    if putusan.run_id is None and run_id is not None:
+        putusan.run_id = run_id
 
     # Discovery adalah sumber informasi terbaru mengenai
     # apakah sebuah putusan sedang berstatus Unpublish.

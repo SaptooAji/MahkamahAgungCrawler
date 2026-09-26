@@ -11,8 +11,8 @@ from models.scraping_run import ScrapingRun
 
 import os
 from dotenv import load_dotenv
-
-load_dotenv()
+env_file = os.getenv("ENV_FILE", ".env")
+load_dotenv(env_file)
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.

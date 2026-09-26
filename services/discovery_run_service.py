@@ -149,6 +149,16 @@ class DiscoveryRunService:
 
         return created_count
 
+    def mark_discovery_phase_completed(
+        self,
+        session: Session,
+        *,
+        run: ScrapingRun,
+    ) -> ScrapingRun:
+        run.status = ScrapingRunStatus.DISCOVERY_COMPLETED
+        session.flush()
+        return run
+    
     async def discover_run(
         self,
         browser,

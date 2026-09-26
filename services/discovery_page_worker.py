@@ -31,6 +31,7 @@ class DiscoveryPageProcessResult:
 class ClaimedDiscoveryPage:
     page_job_id: int
     processing_token: str
+    run_id: int
     page_number: int
     tahun: int
     url_page: str
@@ -65,6 +66,7 @@ class DiscoveryPageWorker:
             return ClaimedDiscoveryPage(
                 page_job_id=page_job.id,
                 processing_token=page_job.processing_token,
+                run_id=page_job.run_id,
                 page_number=page_job.page_number,
                 tahun=page_job.tahun,
                 url_page=page_job.url_page,
@@ -105,6 +107,7 @@ class DiscoveryPageWorker:
             with SessionLocal.begin() as session:
                 for item in discovered:
                     data = DiscoveredPutusanData(
+                        run_id=claimed.run_id,
                         tahun=claimed.tahun,
                         halaman=claimed.page_number,
                         url_detail=item.url_detail,

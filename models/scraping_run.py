@@ -17,6 +17,8 @@ class ScrapingRunStatus(str, Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    DISCOVERY_COMPLETED = "DISCOVERY_COMPLETED"
+
 
 
 class ScrapingRun(Base):
