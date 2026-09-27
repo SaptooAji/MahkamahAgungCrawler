@@ -11,6 +11,9 @@ from models.discovery_page_job import (
 )
 
 
+MAX_DISCOVERY_PAGE_ATTEMPTS = 3
+
+
 def create_page_job(
     session: Session,
     *,
@@ -221,16 +224,22 @@ def mark_page_failed_retry(
             "worker/token tidak cocok."
         )
 
-    page_job.status = DiscoveryPageJobStatus.FAILED_RETRY
+    now = datetime.now(timezone.utc)
+
     page_job.retry_count += 1
     page_job.last_error = error_message
     page_job.processing_started_at = None
     page_job.processing_worker_id = None
     page_job.processing_token = None
-    page_job.next_retry_at = (
-        datetime.now(timezone.utc)
-        + timedelta(seconds=retry_delay_seconds)
-    )
+
+    if page_job.retry_count >= MAX_DISCOVERY_PAGE_ATTEMPTS:
+        page_job.status = DiscoveryPageJobStatus.FAILED_PERMANENT
+        page_job.next_retry_at = None
+    else:
+        page_job.status = DiscoveryPageJobStatus.FAILED_RETRY
+        page_job.next_retry_at = (
+            now + timedelta(seconds=retry_delay_seconds)
+        )
 
     session.flush()
 
@@ -259,7 +268,6 @@ def recover_stale_page_jobs(
     page_jobs = session.scalars(stmt).all()
 
     for page_job in page_jobs:
-        page_job.status = DiscoveryPageJobStatus.FAILED_RETRY
         page_job.retry_count += 1
         page_job.last_error = (
             "Processing lease expired; job recovered automatically."
@@ -267,7 +275,13 @@ def recover_stale_page_jobs(
         page_job.processing_started_at = None
         page_job.processing_worker_id = None
         page_job.processing_token = None
-        page_job.next_retry_at = now
+
+        if page_job.retry_count >= MAX_DISCOVERY_PAGE_ATTEMPTS:
+            page_job.status = DiscoveryPageJobStatus.FAILED_PERMANENT
+            page_job.next_retry_at = None
+        else:
+            page_job.status = DiscoveryPageJobStatus.FAILED_RETRY
+            page_job.next_retry_at = now
 
     session.flush()
 

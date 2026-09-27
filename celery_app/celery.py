@@ -1,16 +1,26 @@
-# celery_app/celery.py
-
 import os
 
 from celery import Celery
+from celery.signals import setup_logging
 from dotenv import load_dotenv
+
+from logging_config import configure_logging
+
+
 env_file = os.getenv("ENV_FILE", ".env")
 load_dotenv(env_file)
+
+configure_logging()
+
+
+@setup_logging.connect
+def configure_celery_logging(*args, **kwargs):
+    configure_logging()
+
 
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = os.getenv("REDIS_PORT", "6379")
 REDIS_DB = os.getenv("REDIS_DB", "0")
-
 
 REDIS_URL = f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
 

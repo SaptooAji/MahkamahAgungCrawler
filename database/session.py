@@ -15,12 +15,15 @@ POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
 POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
 
 
-DATABASE_URL = (
-    f"postgresql+psycopg://"
-    f"{POSTGRES_USER}:{POSTGRES_PASSWORD}"
-    f"@{POSTGRES_HOST}:{POSTGRES_PORT}"
-    f"/{POSTGRES_DB}"
-)
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    DATABASE_URL = (
+        f"postgresql+psycopg://"
+        f"{POSTGRES_USER}:{POSTGRES_PASSWORD}"
+        f"@{POSTGRES_HOST}:{POSTGRES_PORT}"
+        f"/{POSTGRES_DB}"
+    )
 
 
 engine = create_engine(

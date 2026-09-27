@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import socket
 from dataclasses import asdict
+from datetime import datetime, timezone
 
 import nodriver as uc
 
 from celery_app.celery import celery_app
-from scraper.detail_page import (DetailPageScraper, build_detail_page_scraper)
+from celery import chord
+from database.session import SessionLocal
+from scraper.detail_page import (
+    DetailPageScraper,
+    build_detail_page_scraper,
+)
 from scraper.discovery_page import DiscoveryPageScraper
 from services.discovery_page_worker import build_discovery_page_worker
 from services.putusan_worker import build_putusan_worker
@@ -16,6 +23,11 @@ from services.putusan_dispatcher import get_pending_putusan_ids
 from services.discovery_page_dispatcher import (
     get_pending_discovery_page_ids,
 )
+from models.scraping_run import ScrapingRun, ScrapingRunStatus
+from services.discovery_run_service import discovery_run_service
+
+
+logger = logging.getLogger(f"celery.{__name__}")
 
 
 def get_worker_id() -> str:
@@ -30,17 +42,31 @@ async def _process_putusan(
     putusan_id: int,
     worker_id: str,
 ) -> dict:
+    logger.info(
+        "PUTUSAN_TASK_START putusan_id=%s worker_id=%s",
+        putusan_id,
+        worker_id,
+    )
+
     worker = build_putusan_worker()
 
     # ============================================================
     # 1. CLAIM DULU
     # ============================================================
+
     claimed = worker.claim(
         putusan_id=putusan_id,
         worker_id=worker_id,
     )
 
     if claimed is None:
+        logger.info(
+            "PUTUSAN_TASK_SKIPPED "
+            "putusan_id=%s worker_id=%s reason=claim_failed",
+            putusan_id,
+            worker_id,
+        )
+
         return {
             "putusan_id": putusan_id,
             "status": "SKIPPED",
@@ -53,9 +79,16 @@ async def _process_putusan(
             ),
         }
 
+    logger.info(
+        "PUTUSAN_CLAIMED putusan_id=%s worker_id=%s",
+        putusan_id,
+        worker_id,
+    )
+
     # ============================================================
     # 2. BARU START BROWSER
     # ============================================================
+
     browser = await uc.start(
         headless=False,
         browser_args=[
@@ -65,14 +98,29 @@ async def _process_putusan(
         ],
     )
 
+    logger.info(
+        "PUTUSAN_BROWSER_STARTED putusan_id=%s worker_id=%s",
+        putusan_id,
+        worker_id,
+    )
+
     try:
         # ========================================================
         # 3. SCRAPE PUTUSAN YANG SUDAH DI-CLAIM
         # ========================================================
+
         result = await worker.process_claimed(
             browser,
             claimed=claimed,
             worker_id=worker_id,
+        )
+
+        logger.info(
+            "PUTUSAN_TASK_FINISHED "
+            "putusan_id=%s worker_id=%s status=%s",
+            result.putusan_id,
+            worker_id,
+            result.status,
         )
 
         return {
@@ -83,7 +131,29 @@ async def _process_putusan(
             "error_message": result.error_message,
         }
 
+    except Exception as exc:
+        logger.exception(
+            "PUTUSAN_TASK_ERROR "
+            "putusan_id=%s worker_id=%s",
+            putusan_id,
+            worker_id,
+        )
+
+        return {
+            "putusan_id": putusan_id,
+            "status": "FAILED_RETRY",
+            "url_detail": "",
+            "url_pdf": None,
+            "error_message": f"{type(exc).__name__}: {exc}",
+        }
+
     finally:
+        logger.info(
+            "PUTUSAN_BROWSER_STOP "
+            "putusan_id=%s worker_id=%s",
+            putusan_id,
+            worker_id,
+        )
         browser.stop()
 
 @celery_app.task(
@@ -95,12 +165,19 @@ def dispatch_pending_putusan(
     batch_size: int = 5,
 ) -> dict:
     """
-    Mengirim maksimal batch_size Putusan yang siap diproses
-    ke Celery.
+    Mengirim maksimal batch_size Putusan yang siap diproses.
 
     Dispatcher tidak melakukan claim.
     Claim dilakukan oleh putusan.process.
+
+    Batch berikutnya hanya dijadwalkan setelah seluruh task
+    pada batch saat ini selesai.
     """
+
+    logger.info(
+        "PUTUSAN_DISPATCH_START batch_size=%s",
+        batch_size,
+    )
 
     if batch_size < 1:
         raise ValueError("batch_size harus >= 1")
@@ -114,16 +191,48 @@ def dispatch_pending_putusan(
         batch_size=batch_size,
     )
 
-    task_ids = []
+    logger.info(
+        "PUTUSAN_DISPATCH_SELECTED "
+        "putusan_ids=%s count=%s",
+        putusan_ids,
+        len(putusan_ids),
+    )
 
-    for putusan_id in putusan_ids:
-        result = process_putusan.delay(putusan_id)
-        task_ids.append(result.id)
+    if not putusan_ids:
+        logger.info(
+            "PUTUSAN_DISPATCH_EMPTY"
+        )
+
+        return {
+            "dispatched": 0,
+            "putusan_ids": [],
+            "task_ids": [],
+            "next_batch_scheduled": False,
+        }
+
+    tasks = [
+        process_putusan.s(putusan_id)
+        for putusan_id in putusan_ids
+    ]
+
+    callback = dispatch_pending_putusan.si(
+        batch_size=batch_size,
+    )
+
+    result = chord(tasks)(callback)
+
+    logger.info(
+        "PUTUSAN_BATCH_SCHEDULED "
+        "putusan_ids=%s chord_id=%s",
+        putusan_ids,
+        result.id,
+    )
 
     return {
         "dispatched": len(putusan_ids),
         "putusan_ids": putusan_ids,
-        "task_ids": task_ids,
+        "chord_id": result.id,
+        "next_batch_scheduled": True,
     }
 
 @celery_app.task(
@@ -159,6 +268,7 @@ async def _process_discovery_page_batch(
     Memproses satu batch DiscoveryPageJob secara sequential.
 
     Invariant:
+
     - maksimal 5 job per batch;
     - claim dilakukan sebelum browser dimulai;
     - satu batch menggunakan satu browser;
@@ -167,6 +277,13 @@ async def _process_discovery_page_batch(
     Lifecycle status job tetap menjadi tanggung jawab
     DiscoveryPageWorker melalui process_claimed().
     """
+
+    logger.info(
+        "DISCOVERY_BATCH_START "
+        "page_job_ids=%s worker_id=%s",
+        page_job_ids,
+        worker_id,
+    )
 
     if not page_job_ids:
         return {
@@ -195,6 +312,7 @@ async def _process_discovery_page_batch(
     # ------------------------------------------------------------
     # 1. CLAIM SEMUA JOB DULU
     # ------------------------------------------------------------
+
     claimed_jobs = []
     skipped_ids = []
 
@@ -205,12 +323,28 @@ async def _process_discovery_page_batch(
         )
 
         if claimed is None:
+            logger.info(
+                "DISCOVERY_PAGE_SKIPPED "
+                "page_job_id=%s worker_id=%s reason=claim_failed",
+                page_job_id,
+                worker_id,
+            )
+
             skipped_ids.append(page_job_id)
             continue
+
+        logger.info(
+            "DISCOVERY_PAGE_CLAIMED "
+            "page_job_id=%s page_number=%s worker_id=%s",
+            claimed.page_job_id,
+            claimed.page_number,
+            worker_id,
+        )
 
         claimed_jobs.append(claimed)
 
     # Tidak ada job yang berhasil di-claim.
+
     if not claimed_jobs:
         return {
             "requested": len(page_job_ids),
@@ -233,6 +367,7 @@ async def _process_discovery_page_batch(
     # ------------------------------------------------------------
     # 2. BARU START SATU BROWSER
     # ------------------------------------------------------------
+
     browser = await uc.start(
         headless=False,
         browser_args=[
@@ -240,6 +375,13 @@ async def _process_discovery_page_batch(
             "--disable-dev-shm-usage",
             "--mute-audio",
         ],
+    )
+
+    logger.info(
+        "DISCOVERY_BROWSER_STARTED "
+        "worker_id=%s claimed_count=%s",
+        worker_id,
+        len(claimed_jobs),
     )
 
     results = [
@@ -257,6 +399,7 @@ async def _process_discovery_page_batch(
         # --------------------------------------------------------
         # 3. PROCESS SEQUENTIAL DALAM SATU BROWSER
         # --------------------------------------------------------
+
         for claimed in claimed_jobs:
             try:
                 result = await worker.process_claimed(
@@ -269,11 +412,34 @@ async def _process_discovery_page_batch(
                     **asdict(result),
                     "status": "SUCCESS",
                 })
+
+                logger.info(
+                    "DISCOVERY_PAGE_FINISHED "
+                    "page_job_id=%s page_number=%s status=SUCCESS "
+                    "discovered_count=%s created_count=%s "
+                    "existing_count=%s worker_id=%s",
+                    claimed.page_job_id,
+                    claimed.page_number,
+                    result.discovered_count,
+                    result.created_count,
+                    result.existing_count,
+                    worker_id,
+                )
+
                 success_count += 1
 
             except Exception as exc:
+                logger.exception(
+                    "DISCOVERY_PAGE_ERROR "
+                    "page_job_id=%s page_number=%s worker_id=%s",
+                    claimed.page_job_id,
+                    claimed.page_number,
+                    worker_id,
+                )
+
                 # process_claimed() sudah bertanggung jawab menandai
                 # job FAILED_RETRY sebelum exception dilempar kembali.
+
                 results.append({
                     "page_job_id": claimed.page_job_id,
                     "page_number": claimed.page_number,
@@ -282,6 +448,7 @@ async def _process_discovery_page_batch(
                         f"{type(exc).__name__}: {exc}"
                     ),
                 })
+
                 failed_count += 1
 
         return {
@@ -295,6 +462,13 @@ async def _process_discovery_page_batch(
         }
 
     finally:
+        logger.info(
+            "DISCOVERY_BROWSER_STOP "
+            "worker_id=%s claimed_count=%s",
+            worker_id,
+            len(claimed_jobs),
+        )
+
         browser.stop()
 
 
@@ -305,6 +479,7 @@ async def _process_discovery_page_batch(
 def dispatch_pending_discovery_page(
     self,
     batch_size: int = DISCOVERY_BATCH_SIZE_MAX,
+    run_id: int | None = None,
 ) -> dict:
     """
     Memulai satu batch DiscoveryPageJob.
@@ -312,6 +487,13 @@ def dispatch_pending_discovery_page(
     Dispatcher hanya memilih ID yang siap diproses.
     Claim tetap dilakukan oleh batch worker setelah task dimulai.
     """
+
+    logger.info(
+        "DISCOVERY_DISPATCH_START "
+        "batch_size=%s run_id=%s",
+        batch_size,
+        run_id,
+    )
 
     if batch_size < 1:
         raise ValueError("batch_size harus >= 1")
@@ -323,9 +505,23 @@ def dispatch_pending_discovery_page(
 
     page_job_ids = get_pending_discovery_page_ids(
         batch_size=batch_size,
+        run_id=run_id,
+    )
+
+    logger.info(
+        "DISCOVERY_DISPATCH_SELECTED "
+        "run_id=%s page_job_ids=%s count=%s",
+        run_id,
+        page_job_ids,
+        len(page_job_ids),
     )
 
     if not page_job_ids:
+        logger.info(
+            "DISCOVERY_DISPATCH_EMPTY run_id=%s",
+            run_id,
+        )
+
         return {
             "dispatched": 0,
             "page_job_ids": [],
@@ -334,6 +530,15 @@ def dispatch_pending_discovery_page(
 
     result = process_discovery_page_batch.delay(
         page_job_ids,
+        run_id=run_id,
+    )
+
+    logger.info(
+        "DISCOVERY_BATCH_SCHEDULED "
+        "run_id=%s page_job_ids=%s task_id=%s",
+        run_id,
+        page_job_ids,
+        result.id,
     )
 
     return {
@@ -350,6 +555,7 @@ def dispatch_pending_discovery_page(
 def process_discovery_page_batch(
     self,
     page_job_ids: list[int],
+    run_id: int | None = None,
 ) -> dict:
     """
     Celery entry point untuk satu batch.
@@ -378,6 +584,14 @@ def process_discovery_page_batch(
 
     worker_id = get_worker_id()
 
+    logger.info(
+        "DISCOVERY_BATCH_TASK_START "
+        "run_id=%s page_job_ids=%s worker_id=%s",
+        run_id,
+        page_job_ids,
+        worker_id,
+    )
+
     result = asyncio.run(
         _process_discovery_page_batch(
             page_job_ids,
@@ -388,18 +602,38 @@ def process_discovery_page_batch(
     # ------------------------------------------------------------
     # AUTOMATIC NEXT BATCH
     # ------------------------------------------------------------
+
     next_page_job_ids = get_pending_discovery_page_ids(
         batch_size=DISCOVERY_BATCH_SIZE_MAX,
+        run_id=run_id,
     )
 
     if next_page_job_ids:
         next_task = process_discovery_page_batch.delay(
             next_page_job_ids,
+            run_id=run_id,
+        )
+
+        logger.info(
+            "DISCOVERY_NEXT_BATCH_SCHEDULED "
+            "run_id=%s page_job_ids=%s task_id=%s worker_id=%s",
+            run_id,
+            next_page_job_ids,
+            next_task.id,
+            worker_id,
         )
 
         result["next_batch_scheduled"] = True
         result["next_task_id"] = next_task.id
+
     else:
+        logger.info(
+            "DISCOVERY_BATCH_CHAIN_COMPLETE "
+            "run_id=%s worker_id=%s",
+            run_id,
+            worker_id,
+        )
+
         result["next_batch_scheduled"] = False
         result["next_task_id"] = None
 
@@ -418,6 +652,7 @@ def process_discovery_page(
     Manual/recovery path untuk satu DiscoveryPageJob.
 
     Path ini sengaja dipertahankan untuk debugging dan recovery.
+
     Jalur normal Phase 5 menggunakan process_discovery_page_batch.
     """
 
@@ -449,6 +684,13 @@ async def _process_discovery_page(
     )
 
     if claimed is None:
+        logger.info(
+            "DISCOVERY_PAGE_MANUAL_SKIPPED "
+            "page_job_id=%s worker_id=%s reason=claim_failed",
+            page_job_id,
+            worker_id,
+        )
+
         return {
             "page_job_id": page_job_id,
             "page_number": None,
@@ -464,6 +706,14 @@ async def _process_discovery_page(
             ),
         }
 
+    logger.info(
+        "DISCOVERY_PAGE_MANUAL_CLAIMED "
+        "page_job_id=%s page_number=%s worker_id=%s",
+        claimed.page_job_id,
+        claimed.page_number,
+        worker_id,
+    )
+
     browser = await uc.start(
         headless=False,
         browser_args=[
@@ -473,6 +723,13 @@ async def _process_discovery_page(
         ],
     )
 
+    logger.info(
+        "DISCOVERY_MANUAL_BROWSER_STARTED "
+        "page_job_id=%s worker_id=%s",
+        claimed.page_job_id,
+        worker_id,
+    )
+
     try:
         result = await worker.process_claimed(
             browser,
@@ -480,7 +737,232 @@ async def _process_discovery_page(
             worker_id=worker_id,
         )
 
+        logger.info(
+            "DISCOVERY_PAGE_FINISHED "
+            "page_job_id=%s page_number=%s status=SUCCESS "
+            "discovered_count=%s created_count=%s "
+            "existing_count=%s worker_id=%s",
+            claimed.page_job_id,
+            claimed.page_number,
+            result.discovered_count,
+            result.created_count,
+            result.existing_count,
+            worker_id,
+        )
+
         return asdict(result)
 
+    except Exception:
+        logger.exception(
+            "DISCOVERY_PAGE_MANUAL_ERROR "
+            "page_job_id=%s page_number=%s worker_id=%s",
+            claimed.page_job_id,
+            claimed.page_number,
+            worker_id,
+        )
+        raise
+
     finally:
+        logger.info(
+            "DISCOVERY_MANUAL_BROWSER_STOP "
+            "page_job_id=%s worker_id=%s",
+            claimed.page_job_id,
+            worker_id,
+        )
+
         browser.stop()
+
+
+@celery_app.task(
+    name="scraping_run.process",
+)
+def process_scraping_run(run_id: int) -> dict:
+    logger.info(
+        "SCRAPING_RUN_TASK_START run_id=%s",
+        run_id,
+    )
+
+    return asyncio.run(
+        _process_scraping_run(
+            run_id=run_id,
+            worker_id=get_worker_id(),
+        )
+    )
+
+
+async def _process_scraping_run(
+    run_id: int,
+    worker_id: str,
+) -> dict:
+    # ---------------------------------------------------------
+    # STEP 1 — Claim run dalam transaction pendek
+    # ---------------------------------------------------------
+
+    logger.info(
+        "SCRAPING_RUN_CLAIM_START "
+        "run_id=%s worker_id=%s",
+        run_id,
+        worker_id,
+    )
+
+    with SessionLocal.begin() as session:
+        run = discovery_run_service.claim_run(
+            session,
+            run_id=run_id,
+        )
+
+        if run is None:
+            logger.info(
+                "SCRAPING_RUN_SKIPPED "
+                "run_id=%s worker_id=%s reason=run_not_claimable",
+                run_id,
+                worker_id,
+            )
+
+            return {
+                "run_id": run_id,
+                "status": "SKIPPED",
+                "reason": "run_not_claimable",
+            }
+
+        claimed_run_id = run.id
+        tahun = run.tahun
+        url_halaman_pertama = run.url_halaman_pertama
+
+    logger.info(
+        "SCRAPING_RUN_CLAIMED "
+        "run_id=%s tahun=%s worker_id=%s",
+        claimed_run_id,
+        tahun,
+        worker_id,
+    )
+
+    # ---------------------------------------------------------
+    # STEP 2 — Browser discovery
+    #
+    # Tidak ada transaction DB yang terbuka di sini.
+    # ---------------------------------------------------------
+
+    browser = None
+
+    try:
+        logger.info(
+            "SCRAPING_RUN_BROWSER_START "
+            "run_id=%s worker_id=%s",
+            claimed_run_id,
+            worker_id,
+        )
+
+        browser = await uc.start(
+            headless=False,
+        )
+
+        logger.info(
+            "SCRAPING_RUN_BROWSER_STARTED "
+            "run_id=%s worker_id=%s",
+            claimed_run_id,
+            worker_id,
+        )
+
+        pagination_result = (
+            await discovery_run_service.discover_pagination(
+                browser,
+                url_halaman_pertama=url_halaman_pertama,
+            )
+        )
+
+        logger.info(
+            "SCRAPING_RUN_PAGINATION_FINISHED "
+            "run_id=%s tahun=%s total_pages=%s "
+            "pagination_mode=%s worker_id=%s",
+            claimed_run_id,
+            tahun,
+            pagination_result.total_pages,
+            pagination_result.mode.value,
+            worker_id,
+        )
+
+    except Exception as exc:
+        logger.exception(
+            "SCRAPING_RUN_ERROR "
+            "run_id=%s worker_id=%s",
+            claimed_run_id,
+            worker_id,
+        )
+
+        # Mark FAILED dalam transaction terpisah.
+
+        with SessionLocal.begin() as session:
+            run = session.get(
+                ScrapingRun,
+                claimed_run_id,
+            )
+
+            if run is not None:
+                run.status = ScrapingRunStatus.FAILED
+                run.last_error = str(exc)
+                run.finished_at = datetime.now(timezone.utc)
+
+        raise
+
+    finally:
+        if browser is not None:
+            logger.info(
+                "SCRAPING_RUN_BROWSER_STOP "
+                "run_id=%s worker_id=%s",
+                claimed_run_id,
+                worker_id,
+            )
+
+            browser.stop()
+
+    # ---------------------------------------------------------
+    # STEP 3 — Persist hasil discovery
+    #
+    # Transaction baru setelah browser selesai.
+    # ---------------------------------------------------------
+
+    with SessionLocal.begin() as session:
+        run = session.get(
+            ScrapingRun,
+            claimed_run_id,
+        )
+
+        if run is None:
+            raise RuntimeError(
+                f"ScrapingRun {claimed_run_id} tidak ditemukan."
+            )
+
+        discovery_run_service.persist_pagination_result(
+            session,
+            run=run,
+            pagination_result=pagination_result,
+        )
+
+        discovery_run_service.mark_discovery_phase_completed(
+            session,
+            run=run,
+        )
+
+        logger.info(
+            "SCRAPING_RUN_DISCOVERY_COMPLETED "
+            "run_id=%s tahun=%s status=%s "
+            "total_pages=%s pagination_mode=%s "
+            "total_discovered=%s worker_id=%s",
+            run.id,
+            tahun,
+            run.status.value,
+            pagination_result.total_pages,
+            pagination_result.mode.value,
+            run.total_discovered,
+            worker_id,
+        )
+
+        return {
+            "run_id": run.id,
+            "tahun": tahun,
+            "status": run.status.value,
+            "total_pages": pagination_result.total_pages,
+            "pagination_mode": pagination_result.mode.value,
+            "total_discovered": run.total_discovered,
+        }

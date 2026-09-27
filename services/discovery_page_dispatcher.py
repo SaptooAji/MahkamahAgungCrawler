@@ -20,7 +20,9 @@ class PendingDiscoveryPage:
 def get_pending_discovery_page_ids(
     *,
     batch_size: int = 5,
+    run_id: int | None = None,
 ) -> list[int]:
+
     if batch_size < 1:
         raise ValueError("batch_size harus >= 1")
 
@@ -46,6 +48,15 @@ def get_pending_discovery_page_ids(
                     | (DiscoveryPageJob.next_retry_at <= now)
                 ),
             )
+        )
+
+        if run_id is not None:
+            stmt = stmt.where(
+                DiscoveryPageJob.run_id == run_id
+            )
+
+        stmt = (
+            stmt
             .order_by(DiscoveryPageJob.id)
             .limit(batch_size)
         )

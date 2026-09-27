@@ -1,0 +1,4 @@
+# Application logs
+logs/
+__pycache__/
+*.pyc

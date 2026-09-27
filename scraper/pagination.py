@@ -38,6 +38,93 @@ class PaginationScraper:
     - Jika tidak -> SEQUENTIAL.
     """
 
+    PAGE_HEALTH_JS = r"""
+    (() => {
+        const title = (
+            document.title || ""
+        ).trim();
+
+        const titleLower = title.toLowerCase();
+
+        const bodyText = (
+            document.body?.innerText || ""
+        ).trim();
+
+        const bodyTextLower = bodyText.toLowerCase();
+
+        const isCloudflare =
+            titleLower.includes("just a moment") ||
+            bodyTextLower.includes(
+                "performing security verification"
+            ) ||
+            bodyTextLower.includes(
+                "verify you are human"
+            ) ||
+            bodyTextLower.includes(
+                "checking your browser"
+            ) ||
+            bodyTextLower.includes(
+                "checking if the site connection is secure"
+            ) ||
+            document.querySelector(
+                "#challenge-running"
+            ) !== null ||
+            document.querySelector(
+                "#challenge-stage"
+            ) !== null ||
+            document.querySelector(
+                ".cf-chl-widget"
+            ) !== null ||
+            document.querySelector(
+                "iframe[src*='challenges.cloudflare.com']"
+            ) !== null;
+
+        if (isCloudflare) {
+            return JSON.stringify({
+                status: "CLOUDFLARE_CHALLENGE",
+                title: title
+            });
+        }
+
+        const serverErrorPatterns = [
+            "500 - exception error",
+            "terjadi kesalahan pada aplikasi",
+            "http error 500",
+            "http error 502",
+            "http error 503",
+            "http error 504",
+            "http error 505",
+            "error 500",
+            "error 502",
+            "error 503",
+            "error 504",
+            "error 505",
+            "http version not supported"
+        ];
+
+        const matchedErrors =
+            serverErrorPatterns.filter(
+                (pattern) =>
+                    titleLower.includes(pattern) ||
+                    bodyTextLower.includes(pattern)
+            );
+
+        if (matchedErrors.length > 0) {
+            return JSON.stringify({
+                status: "RETRYABLE_ERROR",
+                title: title,
+                matched_errors: matchedErrors
+            });
+        }
+
+        return JSON.stringify({
+            status: "OK",
+            title: title
+        });
+    })()
+    """
+
+
     PAGINATION_JS = r"""
     (() => {
         const paginationRoot =
@@ -468,6 +555,154 @@ class PaginationScraper:
 
         return None
 
+    async def _check_page_health(
+        self,
+        page,
+    ) -> dict:
+        raw = await page.evaluate(
+            self.PAGE_HEALTH_JS
+        )
+
+        if not raw:
+            raise RuntimeError(
+                "JavaScript page health "
+                "tidak menghasilkan data."
+            )
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "Hasil JavaScript page health "
+                "bukan JSON valid."
+            ) from exc
+
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                "Hasil JavaScript page health "
+                "harus berupa object."
+            )
+
+        return data
+
+    @staticmethod
+    def _build_page_1_candidates(
+        url_page_1: str,
+    ) -> list[str]:
+        """
+        Membuat kandidat URL page 1.
+
+        Prioritas:
+        1. URL yang diberikan
+        2. Bentuk alternatif tanpa / dengan .html
+
+        Contoh:
+
+            /tahun/2000.html
+            ->
+            [
+                /tahun/2000.html,
+                /tahun/2000,
+            ]
+
+            /tahun/2021
+            ->
+            [
+                /tahun/2021,
+                /tahun/2021.html,
+            ]
+        """
+
+        parsed = urlparse(url_page_1)
+
+        path = parsed.path
+
+        if path.endswith(".html"):
+            alternative_path = path[:-5]
+        else:
+            alternative_path = f"{path}.html"
+
+        alternative_url = parsed._replace(
+            path=alternative_path
+        ).geturl()
+
+        candidates = [
+            url_page_1,
+            alternative_url,
+        ]
+
+        # Hilangkan duplicate tanpa mengubah urutan.
+        return list(dict.fromkeys(candidates))
+
+    async def _resolve_page_1_url(
+        self,
+        browser,
+        *,
+        url_page_1: str,
+    ) -> tuple[str, object]:
+        """
+        Mencari URL page 1 yang benar-benar sehat.
+
+        Candidate dicoba berdasarkan urutan.
+
+        Jika candidate menampilkan:
+        - OK -> digunakan
+        - RETRYABLE_ERROR -> coba candidate berikutnya
+        - CLOUDFLARE_CHALLENGE -> langsung error
+
+        Jika seluruh candidate gagal -> error.
+        """
+
+        candidates = self._build_page_1_candidates(
+            url_page_1
+        )
+
+        errors: list[str] = []
+
+        for candidate_url in candidates:
+            page = await browser.get(
+                candidate_url
+            )
+
+            await page.sleep(
+                self.render_wait_seconds
+            )
+
+            health = await self._check_page_health(
+                page
+            )
+
+            status = health.get("status")
+
+            if status == "OK":
+                return candidate_url, page
+
+            if status == "CLOUDFLARE_CHALLENGE":
+                raise RuntimeError(
+                    "Cloudflare challenge masih aktif "
+                    f"pada URL {candidate_url!r}. "
+                    f"title={health.get('title')!r}"
+                )
+
+            if status == "RETRYABLE_ERROR":
+                errors.append(
+                    f"{candidate_url}: "
+                    f"title={health.get('title')!r}; "
+                    f"errors={health.get('matched_errors')}"
+                )
+                continue
+
+            raise RuntimeError(
+                "Status page health tidak dikenal: "
+                f"{status!r}; "
+                f"url={candidate_url!r}"
+            )
+
+        raise RuntimeError(
+            "Semua candidate URL page 1 gagal.\n"
+            + "\n".join(errors)
+        )
+    
     async def discover_pages(
         self,
         browser,
@@ -478,6 +713,16 @@ class PaginationScraper:
         Membuka canonical page 1 dan menentukan
         strategi pagination.
 
+        URL page 1 dapat memiliki dua bentuk:
+
+            /tahun/2000.html
+            /tahun/2000
+
+        Candidate pertama digunakan terlebih dahulu.
+        Jika candidate pertama menghasilkan retryable
+        server/application error, candidate alternatif
+        dicoba.
+
         PREDICTIVE:
             Last ditemukan.
             Page 2 ditemukan.
@@ -487,20 +732,26 @@ class PaginationScraper:
         SEQUENTIAL:
             Digunakan jika predictive tidak aman.
 
-        Page 1 selalu canonical URL.
+        Page 1 selalu menggunakan URL yang berhasil
+        melewati page-health check.
         """
 
-        page = await browser.get(
-            url_page_1
+        # ---------------------------------------------------------
+        # Resolve URL page 1
+        # ---------------------------------------------------------
+        resolved_url_page_1, page = (
+            await self._resolve_page_1_url(
+                browser,
+                url_page_1=url_page_1,
+            )
         )
 
-        await page.sleep(
-            self.render_wait_seconds
-        )
-
+        # ---------------------------------------------------------
+        # Extract pagination
+        # ---------------------------------------------------------
         pagination = await self._extract_pagination(
             page,
-            current_url=url_page_1,
+            current_url=resolved_url_page_1,
         )
 
         links = pagination["links"]
@@ -508,7 +759,6 @@ class PaginationScraper:
         # ---------------------------------------------------------
         # Tidak ada pagination
         # ---------------------------------------------------------
-
         if not pagination["found"]:
             return PaginationResult(
                 mode=PaginationMode.SEQUENTIAL,
@@ -516,7 +766,7 @@ class PaginationScraper:
                 pages=[
                     PageDescriptor(
                         page_number=1,
-                        url_page=url_page_1,
+                        url_page=resolved_url_page_1,
                     )
                 ],
             )
@@ -524,7 +774,6 @@ class PaginationScraper:
         # ---------------------------------------------------------
         # Cari Last
         # ---------------------------------------------------------
-
         last_info = self._find_last_page(
             links=links
         )
@@ -540,7 +789,6 @@ class PaginationScraper:
         # ---------------------------------------------------------
         # Cari page 2 dan page 3
         # ---------------------------------------------------------
-
         page_2_url = self._find_page_link(
             links=links,
             page_number=2,
@@ -554,7 +802,6 @@ class PaginationScraper:
         # ---------------------------------------------------------
         # PREDICTIVE MODE
         # ---------------------------------------------------------
-
         if (
             total_pages is not None
             and total_pages >= 2
@@ -570,7 +817,7 @@ class PaginationScraper:
 
             if page_url_template is not None:
                 pages = self.build_page_descriptors(
-                    current_url=url_page_1,
+                    current_url=resolved_url_page_1,
                     total_pages=total_pages,
                     page_url_template=page_url_template,
                 )
@@ -578,14 +825,13 @@ class PaginationScraper:
                 # -------------------------------------------------
                 # Safety checks
                 # -------------------------------------------------
-
                 if (
                     pages[0].url_page
-                    != url_page_1
+                    != resolved_url_page_1
                 ):
                     raise RuntimeError(
                         "Invariant pagination rusak: "
-                        "page 1 bukan canonical URL."
+                        "page 1 bukan resolved URL."
                     )
 
                 if any(
@@ -607,11 +853,10 @@ class PaginationScraper:
         # ---------------------------------------------------------
         # SEQUENTIAL FALLBACK
         # ---------------------------------------------------------
-
         pages = [
             PageDescriptor(
                 page_number=1,
-                url_page=url_page_1,
+                url_page=resolved_url_page_1,
             )
         ]
 
@@ -628,7 +873,8 @@ class PaginationScraper:
             total_pages=total_pages,
             pages=pages,
         )
-
+    
+    
     async def scrape(
         self,
         browser,

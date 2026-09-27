@@ -113,6 +113,140 @@ class DiscoveryRunService:
 
         return run
 
+
+    def claim_run(
+            self,
+            session: Session,
+            *,
+            run_id: int,
+        ) -> ScrapingRun | None:
+            """
+            Meng-claim satu ScrapingRun untuk discovery worker.
+
+            Hanya ScrapingRun dengan status PENDING yang boleh di-claim.
+
+            PostgreSQL row lock memastikan duplicate Celery task
+            tidak dapat menjalankan discovery yang sama secara bersamaan.
+
+            Return:
+                ScrapingRun jika berhasil di-claim.
+                None jika run tidak ditemukan atau sudah di-claim/
+                diproses oleh worker lain.
+            """
+
+            run = session.scalar(
+                select(ScrapingRun)
+                .where(
+                    ScrapingRun.id == run_id,
+                )
+                .with_for_update()
+            )
+
+            if run is None:
+                return None
+
+            if run.status != ScrapingRunStatus.PENDING:
+                return None
+
+            run.status = ScrapingRunStatus.RUNNING
+            run.started_at = datetime.now(timezone.utc)
+
+            session.flush()
+
+            return run
+
+    async def discover_pagination(
+        self,
+        browser,
+        *,
+        url_halaman_pertama: str,
+    ) -> PaginationResult:
+        """
+        Menjalankan discovery pagination menggunakan browser.
+
+        Method ini hanya melakukan scraping pagination.
+        Tidak melakukan claim atau persistence database.
+        """
+
+        if not url_halaman_pertama:
+            raise ValueError(
+                "url_halaman_pertama tidak boleh kosong."
+            )
+
+        return await self.pagination_scraper.discover_pages(
+            browser,
+            url_page_1=url_halaman_pertama,
+        )
+
+
+
+    
+    async def run_claimed(
+        self,
+        browser,
+        session: Session,
+        *,
+        run: ScrapingRun,
+    ) -> tuple[ScrapingRun, PaginationResult]:
+        """
+        Menjalankan discovery untuk ScrapingRun yang sudah di-claim.
+
+        Prasyarat:
+            run.status == RUNNING
+
+        Method ini tidak melakukan claim dan tidak mengubah
+        status PENDING -> RUNNING.
+
+        Browser berjalan sebelum hasil discovery dipersist
+        ke database.
+        """
+
+        if run.status != ScrapingRunStatus.RUNNING:
+            raise ValueError(
+                "ScrapingRun harus berstatus RUNNING "
+                "sebelum run_claimed() dijalankan."
+            )
+
+        if not run.url_halaman_pertama:
+            raise ValueError(
+                "ScrapingRun tidak memiliki "
+                "url_halaman_pertama."
+            )
+
+        try:
+            pagination_result = (
+                await self.pagination_scraper.discover_pages(
+                    browser,
+                    url_page_1=run.url_halaman_pertama,
+                )
+            )
+
+            created_count = (
+                self.persist_pagination_result(
+                    session,
+                    run=run,
+                    pagination_result=pagination_result,
+                )
+            )
+
+            run.total_discovered = created_count
+
+            session.flush()
+
+            return (
+                run,
+                pagination_result,
+            )
+
+        except Exception as exc:
+            run.status = ScrapingRunStatus.FAILED
+            run.last_error = str(exc)
+            run.finished_at = datetime.now(timezone.utc)
+
+            session.flush()
+
+            raise
+
     def persist_pagination_result(
         self,
         session: Session,

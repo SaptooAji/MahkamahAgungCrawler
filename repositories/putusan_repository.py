@@ -6,7 +6,7 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
 from models.putusan import Putusan, ScrapingStatus
-
+MAX_PUTUSAN_ATTEMPTS = 3
 
 def claim_pending_putusan(
     session: Session,
@@ -246,15 +246,20 @@ def mark_putusan_failed_retry(
 
     now = datetime.now(timezone.utc)
 
-    putusan.status_scraping = ScrapingStatus.FAILED_RETRY
     putusan.retry_count += 1
     putusan.last_error = error_message
     putusan.processing_started_at = None
     putusan.processing_worker_id = None
     putusan.processing_token = None
-    putusan.next_retry_at = (
-        now + timedelta(seconds=retry_delay_seconds)
-    )
+
+    if putusan.retry_count >= MAX_PUTUSAN_ATTEMPTS:
+        putusan.status_scraping = ScrapingStatus.FAILED_PERMANENT
+        putusan.next_retry_at = None
+    else:
+        putusan.status_scraping = ScrapingStatus.FAILED_RETRY
+        putusan.next_retry_at = (
+            now + timedelta(seconds=retry_delay_seconds)
+        )
 
     session.flush()
 
