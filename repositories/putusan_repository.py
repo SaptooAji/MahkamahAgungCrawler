@@ -1,7 +1,7 @@
 from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -339,3 +339,28 @@ def claim_putusan_by_id(
     session.flush()
 
     return putusan
+
+def get_status_counts_by_year(
+    session: Session,
+    *,
+    tahun: int,
+) -> dict[ScrapingStatus, int]:
+    stmt = (
+        select(
+            Putusan.status_scraping,
+            func.count(Putusan.id),
+        )
+        .where(
+            Putusan.tahun == tahun,
+        )
+        .group_by(
+            Putusan.status_scraping,
+        )
+    )
+
+    rows = session.execute(stmt).all()
+
+    return {
+        status: count
+        for status, count in rows
+    }

@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
@@ -272,3 +272,28 @@ def recover_stale_page_jobs(
     session.flush()
 
     return len(page_jobs)
+
+def get_run_status_counts(
+    session: Session,
+    *,
+    run_id: int,
+) -> dict[DiscoveryPageJobStatus, int]:
+    stmt = (
+        select(
+            DiscoveryPageJob.status,
+            func.count(DiscoveryPageJob.id),
+        )
+        .where(
+            DiscoveryPageJob.run_id == run_id,
+        )
+        .group_by(
+            DiscoveryPageJob.status,
+        )
+    )
+
+    rows = session.execute(stmt).all()
+
+    return {
+        status: count
+        for status, count in rows
+    }

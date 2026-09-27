@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 from sqlalchemy.orm import Session
+from sqlalchemy import select
 
 from models.scraping_run import (
     PaginationMode,
@@ -59,11 +60,28 @@ class DiscoveryRunService:
         tahun: int,
         url_halaman_pertama: str,
     ) -> ScrapingRun:
-        """
-        Membuat ScrapingRun baru.
 
-        Run baru selalu dimulai dengan status PENDING.
-        """
+        active_statuses = (
+            ScrapingRunStatus.PENDING,
+            ScrapingRunStatus.RUNNING,
+            ScrapingRunStatus.DISCOVERY_COMPLETED,
+        )
+
+        existing_run = session.scalar(
+            select(ScrapingRun)
+            .where(
+                ScrapingRun.tahun == tahun,
+                ScrapingRun.status.in_(active_statuses),
+            )
+            .order_by(ScrapingRun.id.desc())
+            .limit(1)
+        )
+
+        if existing_run is not None:
+            raise ValueError(
+                f"Masih ada ScrapingRun aktif untuk tahun {tahun}: "
+                f"run_id={existing_run.id}, status={existing_run.status.value}"
+            )
 
         run = ScrapingRun(
             tahun=tahun,
@@ -75,7 +93,7 @@ class DiscoveryRunService:
         session.flush()
 
         return run
-
+    
     def mark_run_running(
         self,
         session: Session,

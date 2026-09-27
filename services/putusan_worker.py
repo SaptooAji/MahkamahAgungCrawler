@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from services.run_finalizer_service import RunFinalizerService
+from models.putusan import Putusan
+from models.scraping_run import ScrapingRun, ScrapingRunStatus
+from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from database.session import SessionLocal
 from scraper.detail_page import (
@@ -52,6 +57,7 @@ class PutusanWorker:
         scraper: DetailPageScraper,
     ) -> None:
         self.scraper = scraper
+        self.run_finalizer_service = RunFinalizerService()
 
     def claim(
         self,
@@ -140,12 +146,31 @@ class PutusanWorker:
                     url_pdf=result.url_pdf,
                 )
 
+                putusan = session.get(Putusan, putusan_id)
+
+                if putusan is None:
+                    raise RuntimeError(
+                        f"Putusan ID {putusan_id} tidak ditemukan "
+                        "setelah mark_success()."
+                    )
+
+                run = self._get_active_run(
+                    session,
+                    tahun=putusan.tahun,
+                )
+
+                if run is not None:
+                    self.run_finalizer_service.try_finalize(
+                        session,
+                        run=run,
+                    )
+
             return PutusanProcessResult(
-                putusan_id=putusan_id,
-                status=result.status.value,
-                url_detail=url_detail,
-                url_pdf=result.url_pdf,
-            )
+                        putusan_id=putusan_id,
+                        status=result.status.value,
+                        url_detail=url_detail,
+                        url_pdf=result.url_pdf,
+                    )
 
         # UNPUBLISHED
         if result.status == DetailScrapeStatus.UNPUBLISHED:
@@ -158,12 +183,31 @@ class PutusanWorker:
                     error_message=result.error_message,
                 )
 
+                putusan = session.get(Putusan, putusan_id)
+
+                if putusan is None:
+                    raise RuntimeError(
+                        f"Putusan ID {putusan_id} tidak ditemukan "
+                        "setelah mark_unpublished()."
+                    )
+
+                run = self._get_active_run(
+                    session,
+                    tahun=putusan.tahun,
+                )
+
+                if run is not None:
+                    self.run_finalizer_service.try_finalize(
+                        session,
+                        run=run,
+                    )
+
             return PutusanProcessResult(
-                putusan_id=putusan_id,
-                status=result.status.value,
-                url_detail=url_detail,
-                error_message=result.error_message,
-            )
+                        putusan_id=putusan_id,
+                        status=result.status.value,
+                        url_detail=url_detail,
+                        error_message=result.error_message,
+                    )
 
         # RETRYABLE / PDF_NOT_FOUND
         if result.status in (
@@ -236,6 +280,28 @@ class PutusanWorker:
             browser,
             claimed=claimed,
             worker_id=worker_id,
+        )
+
+    def _get_active_run(
+        self,
+        session: Session,
+        *,
+        tahun: int,
+    ) -> ScrapingRun | None:
+        active_statuses = (
+            ScrapingRunStatus.PENDING,
+            ScrapingRunStatus.RUNNING,
+            ScrapingRunStatus.DISCOVERY_COMPLETED,
+        )
+
+        return session.scalar(
+            select(ScrapingRun)
+            .where(
+                ScrapingRun.tahun == tahun,
+                ScrapingRun.status.in_(active_statuses),
+            )
+            .order_by(ScrapingRun.id.desc())
+            .limit(1)
         )
 
 

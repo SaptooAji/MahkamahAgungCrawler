@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-
+from services.run_finalizer_service import RunFinalizerService
 from database.session import SessionLocal
+from models.scraping_run import ScrapingRun
 
 from scraper.discovery_page import (
     DiscoveredPutusan as DiscoveredPagePutusan,
@@ -40,6 +41,7 @@ class ClaimedDiscoveryPage:
 class DiscoveryPageWorker:
     def __init__(self, scraper):
         self.scraper = scraper
+        self.run_finalizer_service = RunFinalizerService()
 
     def claim(
         self,
@@ -135,6 +137,17 @@ class DiscoveryPageWorker:
                     processing_token=claimed.processing_token,
                     discovered_count=len(discovered),
                 )
+
+                run = session.get(
+                    ScrapingRun,
+                    claimed.run_id,
+                )
+
+                if run is not None:
+                    self.run_finalizer_service.try_finalize(
+                        session,
+                        run=run,
+                    )
 
             return DiscoveryPageProcessResult(
                 page_job_id=claimed.page_job_id,
