@@ -26,6 +26,13 @@ class Putusan(Base):
                 "ix_putusan_status_scraping",
                 "status_scraping",
             ),
+            Index(
+                "ix_putusan_run_status_retry",
+                "run_id",
+                "status_scraping",
+                "next_retry_at",
+                "id",
+            ),
         )
     
     id: Mapped[int] = mapped_column(

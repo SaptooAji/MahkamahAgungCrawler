@@ -10,7 +10,7 @@ from repositories.discovery_page_job_repository import (
     get_run_status_counts,
 )
 from repositories.putusan_repository import (
-    get_status_counts_by_year,
+    get_status_counts_by_run_id,
 )
 
 
@@ -88,9 +88,9 @@ class RunFinalizerService:
         # 5. Putusan state
         # ====================================================
 
-        putusan_counts = get_status_counts_by_year(
+        putusan_counts = get_status_counts_by_run_id(
             session,
-            tahun=run.tahun,
+            run_id=run.id,
         )
 
         putusan_non_terminal = sum(
@@ -128,6 +128,19 @@ class RunFinalizerService:
         else:
             run.status = ScrapingRunStatus.COMPLETED
             run.finished_at = _utc_now()
+
+        run.total_success = putusan_counts.get(
+            ScrapingStatus.SUCCESS,
+            0,
+        )
+        run.total_failed = putusan_counts.get(
+            ScrapingStatus.FAILED_PERMANENT,
+            0,
+        )
+        run.total_unpublished = putusan_counts.get(
+            ScrapingStatus.UNPUBLISHED,
+            0,
+        )
 
         session.flush()
 

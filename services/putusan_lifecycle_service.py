@@ -27,11 +27,13 @@ class PutusanLifecycleService:
         *,
         worker_id: str,
         batch_size: int = 10,
+        run_id: int | None = None,
     ) -> list[Putusan]:
         return claim_pending_putusan(
             session,
             worker_id=worker_id,
             batch_size=batch_size,
+            run_id=run_id,
         )
 
     def mark_success(
@@ -104,17 +106,20 @@ class PutusanLifecycleService:
         *,
         putusan_id: int,
         worker_id: str,
+        run_id: int | None = None,
     ) -> Putusan | None:
         return claim_putusan_by_id(
             session,
             putusan_id=putusan_id,
             worker_id=worker_id,
+            run_id=run_id,
         )
 
     def upsert_discovered(
         self,
         session: Session,
         *,
+        run_id: int | None = None,
         tahun: int,
         halaman: int | None,
         url_detail: str,
@@ -123,6 +128,7 @@ class PutusanLifecycleService:
     ) -> tuple[Putusan, bool]:
         return upsert_discovered_putusan(
             session,
+            run_id=run_id,
             tahun=tahun,
             halaman=halaman,
             url_detail=url_detail,

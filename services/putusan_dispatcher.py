@@ -16,6 +16,7 @@ class PendingPutusan:
 def get_pending_putusan_ids(
     *,
     batch_size: int = 5,
+    run_id: int | None = None,
 ) -> list[int]:
     """
     Mengambil ID Putusan yang siap diproses.
@@ -45,8 +46,11 @@ def get_pending_putusan_ids(
                     )
                 ),
             )
-            .order_by(Putusan.id)
-            .limit(batch_size)
         )
+
+        if run_id is not None:
+            stmt = stmt.where(Putusan.run_id == run_id)
+
+        stmt = stmt.order_by(Putusan.id).limit(batch_size)
 
         return list(session.scalars(stmt).all())

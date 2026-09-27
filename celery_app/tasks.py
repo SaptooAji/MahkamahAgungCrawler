@@ -18,11 +18,18 @@ from scraper.detail_page import (
 )
 from scraper.discovery_page import DiscoveryPageScraper
 from services.discovery_page_worker import build_discovery_page_worker
+from services.discovery_page_job_service import discovery_page_job_service
 from services.putusan_worker import build_putusan_worker
 from services.putusan_dispatcher import get_pending_putusan_ids
 from services.discovery_page_dispatcher import (
     get_pending_discovery_page_ids,
 )
+from services.run_finalizer_service import RunFinalizerService
+from repositories.discovery_page_job_repository import get_run_status_counts
+from repositories.putusan_repository import get_status_counts_by_run_id
+from models.discovery_page_job import DiscoveryPageJobStatus
+from models.putusan import Putusan, ScrapingStatus
+from services.putusan_lifecycle_service import putusan_lifecycle_service
 from models.scraping_run import ScrapingRun, ScrapingRunStatus
 from services.discovery_run_service import discovery_run_service
 
@@ -41,6 +48,7 @@ def get_worker_id() -> str:
 async def _process_putusan(
     putusan_id: int,
     worker_id: str,
+    run_id: int | None = None,
 ) -> dict:
     logger.info(
         "PUTUSAN_TASK_START putusan_id=%s worker_id=%s",
@@ -57,6 +65,7 @@ async def _process_putusan(
     claimed = worker.claim(
         putusan_id=putusan_id,
         worker_id=worker_id,
+        run_id=run_id,
     )
 
     if claimed is None:
@@ -89,14 +98,35 @@ async def _process_putusan(
     # 2. BARU START BROWSER
     # ============================================================
 
-    browser = await uc.start(
-        headless=False,
-        browser_args=[
-            "--start-maximized",
-            "--disable-dev-shm-usage",
-            "--mute-audio",
-        ],
-    )
+    try:
+        browser = await uc.start(
+            headless=False,
+            browser_args=[
+                "--start-maximized",
+                "--disable-dev-shm-usage",
+                "--mute-audio",
+            ],
+        )
+    except Exception as exc:
+        with SessionLocal.begin() as session:
+            putusan = session.get(Putusan, putusan_id)
+            if putusan is not None and (
+                run_id is None or putusan.run_id == run_id
+            ):
+                putusan_lifecycle_service.mark_failed_retry(
+                    session,
+                    putusan_id=putusan_id,
+                    worker_id=worker_id,
+                    processing_token=claimed.processing_token,
+                    error_message=f"{type(exc).__name__}: {exc}",
+                )
+                run = session.get(ScrapingRun, putusan.run_id)
+                if run is not None:
+                    RunFinalizerService().try_finalize(
+                        session,
+                        run=run,
+                    )
+        raise
 
     logger.info(
         "PUTUSAN_BROWSER_STARTED putusan_id=%s worker_id=%s",
@@ -163,6 +193,7 @@ async def _process_putusan(
 def dispatch_pending_putusan(
     self,
     batch_size: int = 5,
+    run_id: int | None = None,
 ) -> dict:
     """
     Mengirim maksimal batch_size Putusan yang siap diproses.
@@ -187,8 +218,12 @@ def dispatch_pending_putusan(
             "batch_size maksimal 5 untuk konfigurasi worker saat ini."
         )
 
+    if run_id is None:
+        raise ValueError("run_id wajib diisi untuk dispatcher Putusan.")
+
     putusan_ids = get_pending_putusan_ids(
         batch_size=batch_size,
+        run_id=run_id,
     )
 
     logger.info(
@@ -211,12 +246,13 @@ def dispatch_pending_putusan(
         }
 
     tasks = [
-        process_putusan.s(putusan_id)
+        process_putusan.s(putusan_id, run_id=run_id)
         for putusan_id in putusan_ids
     ]
 
     callback = dispatch_pending_putusan.si(
         batch_size=batch_size,
+        run_id=run_id,
     )
 
     result = chord(tasks)(callback)
@@ -242,6 +278,7 @@ def dispatch_pending_putusan(
 def process_putusan(
     self,
     putusan_id: int,
+    run_id: int | None = None,
 ) -> dict:
     worker_id = get_worker_id()
 
@@ -249,6 +286,7 @@ def process_putusan(
         _process_putusan(
             putusan_id,
             worker_id,
+            run_id,
         )
     )
 
@@ -368,14 +406,35 @@ async def _process_discovery_page_batch(
     # 2. BARU START SATU BROWSER
     # ------------------------------------------------------------
 
-    browser = await uc.start(
-        headless=False,
-        browser_args=[
-            "--start-maximized",
-            "--disable-dev-shm-usage",
-            "--mute-audio",
-        ],
-    )
+    try:
+        browser = await uc.start(
+            headless=False,
+            browser_args=[
+                "--start-maximized",
+                "--disable-dev-shm-usage",
+                "--mute-audio",
+            ],
+        )
+    except Exception as exc:
+        error_message = f"{type(exc).__name__}: {exc}"
+        with SessionLocal.begin() as session:
+            for claimed in claimed_jobs:
+                try:
+                    discovery_page_job_service.mark_failed_retry(
+                        session,
+                        page_job_id=claimed.page_job_id,
+                        worker_id=worker_id,
+                        processing_token=claimed.processing_token,
+                        error_message=error_message,
+                    )
+                except Exception:
+                    logger.exception(
+                        "DISCOVERY_BROWSER_START_RECOVERY_FAILED "
+                        "page_job_id=%s worker_id=%s",
+                        claimed.page_job_id,
+                        worker_id,
+                    )
+        raise
 
     logger.info(
         "DISCOVERY_BROWSER_STARTED "
@@ -966,3 +1025,157 @@ async def _process_scraping_run(
             "pagination_mode": pagination_result.mode.value,
             "total_discovered": run.total_discovered,
         }
+# ============================================================
+# PERIODIC RECOVERY / RETRY MAINTENANCE
+# ============================================================
+
+@celery_app.task(name="maintenance.tick")
+def maintenance_tick() -> dict:
+    """
+    Periodic safety net untuk dua hal yang tidak boleh bergantung
+    pada callback Celery sebelumnya:
+
+    1. recover PROCESSING yang lease-nya sudah stale;
+    2. membangunkan kembali retry yang sudah melewati next_retry_at.
+
+    Dispatcher tetap melakukan claim di task worker sehingga tick ini
+    aman terhadap duplicate scheduling. run_id selalu dibawa sampai
+    dispatcher agar run tidak saling mengambil pekerjaan.
+    """
+    recovered_putusan = 0
+    recovered_pages = 0
+
+    with SessionLocal.begin() as session:
+        recovered_putusan = putusan_lifecycle_service.recover_stale(
+            session,
+            lease_timeout_seconds=1800,
+        )
+
+        from services.discovery_page_job_service import (
+            discovery_page_job_service,
+        )
+
+        recovered_pages = discovery_page_job_service.recover_stale(
+            session,
+            stale_after_seconds=900,
+        )
+
+        active_runs = list(
+            session.scalars(
+                select(ScrapingRun).where(
+                    ScrapingRun.status.in_(
+                        [
+                            ScrapingRunStatus.RUNNING,
+                            ScrapingRunStatus.DISCOVERY_COMPLETED,
+                        ]
+                    )
+                )
+            ).all()
+        )
+
+        run_ids = [run.id for run in active_runs]
+
+        # Finalizer setelah recovery dapat langsung menutup run yang
+        # ternyata sudah terminal.
+        finalizer = RunFinalizerService()
+        for run in active_runs:
+            finalizer.try_finalize(session, run=run)
+
+    scheduled_discovery = []
+    scheduled_putusan = []
+
+    for run_id in run_ids:
+        page_counts = get_run_status_counts_for_maintenance(run_id)
+        page_processing = page_counts.get(
+            DiscoveryPageJobStatus.PROCESSING,
+            0,
+        )
+        page_non_terminal = sum(
+            page_counts.get(status, 0)
+            for status in (
+                DiscoveryPageJobStatus.PENDING,
+                DiscoveryPageJobStatus.PROCESSING,
+                DiscoveryPageJobStatus.FAILED_RETRY,
+            )
+        )
+        if page_processing == 0:
+            page_ids = get_pending_discovery_page_ids(
+                batch_size=5,
+                run_id=run_id,
+            )
+            if page_ids:
+                task = process_discovery_page_batch.delay(
+                    page_ids,
+                    run_id=run_id,
+                )
+                scheduled_discovery.append({
+                    "run_id": run_id,
+                    "task_id": task.id,
+                    "page_job_ids": page_ids,
+                })
+
+        putusan_counts = get_putusan_status_counts_for_maintenance(run_id)
+        putusan_processing = putusan_counts.get(
+            ScrapingStatus.PROCESSING,
+            0,
+        )
+        if (
+            run_status_is_discovery_completed(run_id)
+            and page_non_terminal == 0
+            and putusan_processing == 0
+        ):
+            putusan_ids = get_pending_putusan_ids(
+                batch_size=5,
+                run_id=run_id,
+            )
+            if putusan_ids:
+                task = dispatch_pending_putusan.delay(
+                    batch_size=5,
+                    run_id=run_id,
+                )
+                scheduled_putusan.append({
+                    "run_id": run_id,
+                    "task_id": task.id,
+                    "candidate_ids": putusan_ids,
+                })
+
+    logger.info(
+        "MAINTENANCE_TICK recovered_putusan=%s recovered_pages=%s "
+        "scheduled_discovery=%s scheduled_putusan=%s",
+        recovered_putusan,
+        recovered_pages,
+        len(scheduled_discovery),
+        len(scheduled_putusan),
+    )
+
+    return {
+        "recovered_putusan": recovered_putusan,
+        "recovered_pages": recovered_pages,
+        "scheduled_discovery": scheduled_discovery,
+        "scheduled_putusan": scheduled_putusan,
+    }
+
+
+def get_run_status_counts_for_maintenance(run_id: int) -> dict:
+    with SessionLocal() as session:
+        return get_run_status_counts(
+            session,
+            run_id=run_id,
+        )
+
+
+def get_putusan_status_counts_for_maintenance(run_id: int) -> dict:
+    with SessionLocal() as session:
+        return get_status_counts_by_run_id(
+            session,
+            run_id=run_id,
+        )
+
+
+def run_status_is_discovery_completed(run_id: int) -> bool:
+    with SessionLocal() as session:
+        run = session.get(ScrapingRun, run_id)
+        return (
+            run is not None
+            and run.status == ScrapingRunStatus.DISCOVERY_COMPLETED
+        )

@@ -37,4 +37,10 @@ celery_app.conf.update(
     result_serializer="json",
     timezone="Asia/Jakarta",
     enable_utc=True,
+    beat_schedule={
+        "maintenance-tick-every-30-seconds": {
+            "task": "maintenance.tick",
+            "schedule": 30.0,
+        },
+    },
 )

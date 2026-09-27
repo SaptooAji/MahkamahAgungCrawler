@@ -170,6 +170,16 @@ class DiscoveryPageWorker:
                     error_message=error_message,
                 )
 
+                run = session.get(
+                    ScrapingRun,
+                    claimed.run_id,
+                )
+                if run is not None:
+                    self.run_finalizer_service.try_finalize(
+                        session,
+                        run=run,
+                    )
+
             raise
 
     async def process(

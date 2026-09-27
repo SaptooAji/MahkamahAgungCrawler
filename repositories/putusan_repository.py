@@ -13,6 +13,7 @@ def claim_pending_putusan(
     *,
     worker_id: str,
     batch_size: int = 10,
+    run_id: int | None = None,
 ) -> list[Putusan]:
     now = datetime.now(timezone.utc)
 
@@ -34,6 +35,9 @@ def claim_pending_putusan(
         .limit(batch_size)
         .with_for_update(skip_locked=True)
     )
+
+    if run_id is not None:
+        stmt = stmt.where(Putusan.run_id == run_id)
 
     putusan_list = session.scalars(stmt).all()
 
@@ -289,7 +293,6 @@ def recover_stale_processing_putusan(
     putusan_list = session.scalars(stmt).all()
 
     for putusan in putusan_list:
-        putusan.status_scraping = ScrapingStatus.FAILED_RETRY
         putusan.retry_count += 1
         putusan.last_error = (
             "Processing lease expired; job recovered automatically."
@@ -297,7 +300,12 @@ def recover_stale_processing_putusan(
         putusan.processing_started_at = None
         putusan.processing_worker_id = None
         putusan.processing_token = None
-        putusan.next_retry_at = datetime.now(timezone.utc)
+        if putusan.retry_count >= MAX_PUTUSAN_ATTEMPTS:
+            putusan.status_scraping = ScrapingStatus.FAILED_PERMANENT
+            putusan.next_retry_at = None
+        else:
+            putusan.status_scraping = ScrapingStatus.FAILED_RETRY
+            putusan.next_retry_at = datetime.now(timezone.utc)
 
     session.flush()
 
@@ -309,6 +317,7 @@ def claim_putusan_by_id(
     *,
     putusan_id: int,
     worker_id: str,
+    run_id: int | None = None,
 ) -> Putusan | None:
     now = datetime.now(timezone.utc)
 
@@ -330,6 +339,9 @@ def claim_putusan_by_id(
         .with_for_update(skip_locked=True)
     )
 
+    if run_id is not None:
+        stmt = stmt.where(Putusan.run_id == run_id)
+
     putusan = session.scalar(stmt)
 
     if putusan is None:
@@ -345,19 +357,17 @@ def claim_putusan_by_id(
 
     return putusan
 
-def get_status_counts_by_year(
+def get_status_counts_by_run_id(
     session: Session,
     *,
-    tahun: int,
+    run_id: int,
 ) -> dict[ScrapingStatus, int]:
     stmt = (
         select(
             Putusan.status_scraping,
             func.count(Putusan.id),
         )
-        .where(
-            Putusan.tahun == tahun,
-        )
+        .where(Putusan.run_id == run_id)
         .group_by(
             Putusan.status_scraping,
         )

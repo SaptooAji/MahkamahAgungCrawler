@@ -853,6 +853,10 @@ class PaginationScraper:
         # ---------------------------------------------------------
         # SEQUENTIAL FALLBACK
         # ---------------------------------------------------------
+        # Jangan menebak total halaman dari Last. Traversal mengikuti
+        # link Next aktual sampai Next tidak tersedia. Ini memastikan
+        # fallback benar-benar sequential dan tidak kehilangan halaman
+        # ketika struktur URL predictive tidak aman.
         pages = [
             PageDescriptor(
                 page_number=1,
@@ -860,17 +864,105 @@ class PaginationScraper:
             )
         ]
 
-        if page_2_url is not None:
-            pages.append(
-                PageDescriptor(
-                    page_number=2,
-                    url_page=page_2_url,
+        visited_urls = {resolved_url_page_1}
+        current_page_number = 1
+        current_page_url = resolved_url_page_1
+        current_page = page
+
+        while True:
+            current_pagination = (
+                pagination
+                if current_page_url == resolved_url_page_1
+                else await self._extract_pagination(
+                    current_page,
+                    current_url=current_page_url,
                 )
             )
 
+            next_url = self._find_next_page(
+                links=current_pagination["links"]
+            )
+
+            # Be tolerant of pagination markup that exposes page 2 but
+            # omits rel="next"/"Next" on the first page.
+            if (
+                next_url is None
+                and current_page_number == 1
+                and page_2_url is not None
+            ):
+                next_url = page_2_url
+
+            if not next_url:
+                break
+
+            if next_url in visited_urls:
+                raise RuntimeError(
+                    "Pagination sequential mendeteksi loop URL: "
+                    f"{next_url}"
+                )
+
+            visited_urls.add(next_url)
+
+            parsed_next_number = (
+                self._parse_page_number_from_url(next_url)
+            )
+
+            next_page_number = (
+                parsed_next_number
+                if parsed_next_number is not None
+                else current_page_number + 1
+            )
+
+            if next_page_number <= current_page_number:
+                raise RuntimeError(
+                    "Nomor halaman sequential tidak meningkat: "
+                    f"current={current_page_number}, "
+                    f"next={next_page_number}, url={next_url}"
+                )
+
+            next_page = await browser.get(next_url)
+            await next_page.sleep(self.render_wait_seconds)
+
+            health = await self._check_page_health(next_page)
+            status = health.get("status")
+
+            if status == "CLOUDFLARE_CHALLENGE":
+                raise RuntimeError(
+                    "Cloudflare challenge pada sequential page "
+                    f"{next_page_number}: {next_url!r}; "
+                    f"title={health.get('title')!r}"
+                )
+
+            if status == "RETRYABLE_ERROR":
+                raise RuntimeError(
+                    "Retryable server/application error pada "
+                    f"sequential page {next_page_number}: "
+                    f"{next_url!r}; "
+                    f"errors={health.get('matched_errors')}"
+                )
+
+            if status != "OK":
+                raise RuntimeError(
+                    "Status page health tidak dikenal pada "
+                    f"sequential page {next_page_number}: {status!r}"
+                )
+
+            pages.append(
+                PageDescriptor(
+                    page_number=next_page_number,
+                    url_page=next_url,
+                )
+            )
+
+            current_page_number = next_page_number
+            current_page_url = next_url
+            current_page = next_page
+
         return PaginationResult(
             mode=PaginationMode.SEQUENTIAL,
-            total_pages=total_pages,
+            # Last yang ditemukan tetapi tidak tervalidasi predictive
+            # hanya menjadi observasi; jumlah aktual ditentukan traversal.
+            total_pages=len(pages),
             pages=pages,
         )
     

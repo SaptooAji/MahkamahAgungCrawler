@@ -64,6 +64,7 @@ class PutusanWorker:
         *,
         putusan_id: int,
         worker_id: str,
+        run_id: int | None = None,
     ) -> ClaimedPutusan | None:
         """
         Claim satu Putusan secara atomik.
@@ -79,6 +80,7 @@ class PutusanWorker:
                 session,
                 putusan_id=putusan_id,
                 worker_id=worker_id,
+                run_id=run_id,
             )
 
             if putusan is None:
@@ -154,9 +156,9 @@ class PutusanWorker:
                         "setelah mark_success()."
                     )
 
-                run = self._get_active_run(
+                run = self._get_run_for_putusan(
                     session,
-                    tahun=putusan.tahun,
+                    putusan=putusan,
                 )
 
                 if run is not None:
@@ -191,9 +193,9 @@ class PutusanWorker:
                         "setelah mark_unpublished()."
                     )
 
-                run = self._get_active_run(
+                run = self._get_run_for_putusan(
                     session,
-                    tahun=putusan.tahun,
+                    putusan=putusan,
                 )
 
                 if run is not None:
@@ -229,6 +231,18 @@ class PutusanWorker:
                     error_message=error_message,
                 )
 
+                putusan = session.get(Putusan, putusan_id)
+                if putusan is not None:
+                    run = self._get_run_for_putusan(
+                        session,
+                        putusan=putusan,
+                    )
+                    if run is not None:
+                        self.run_finalizer_service.try_finalize(
+                            session,
+                            run=run,
+                        )
+
             return PutusanProcessResult(
                 putusan_id=putusan_id,
                 status=result.status.value,
@@ -246,6 +260,7 @@ class PutusanWorker:
         *,
         putusan_id: int,
         worker_id: str,
+        run_id: int | None = None,
     ) -> PutusanProcessResult:
         """
         Backward-compatible convenience method.
@@ -262,6 +277,7 @@ class PutusanWorker:
         claimed = self.claim(
             putusan_id=putusan_id,
             worker_id=worker_id,
+            run_id=run_id,
         )
 
         if claimed is None:
@@ -282,27 +298,15 @@ class PutusanWorker:
             worker_id=worker_id,
         )
 
-    def _get_active_run(
+    def _get_run_for_putusan(
         self,
         session: Session,
         *,
-        tahun: int,
+        putusan: Putusan,
     ) -> ScrapingRun | None:
-        active_statuses = (
-            ScrapingRunStatus.PENDING,
-            ScrapingRunStatus.RUNNING,
-            ScrapingRunStatus.DISCOVERY_COMPLETED,
-        )
-
-        return session.scalar(
-            select(ScrapingRun)
-            .where(
-                ScrapingRun.tahun == tahun,
-                ScrapingRun.status.in_(active_statuses),
-            )
-            .order_by(ScrapingRun.id.desc())
-            .limit(1)
-        )
+        if putusan.run_id is None:
+            return None
+        return session.get(ScrapingRun, putusan.run_id)
 
 
 def build_putusan_worker(
