@@ -8,7 +8,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 
 import nodriver as uc
-
+from sqlalchemy import select
 from celery_app.celery import celery_app
 from celery import chord
 from database.session import SessionLocal

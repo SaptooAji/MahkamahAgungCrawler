@@ -1,4 +1,4 @@
 # Application logs
 logs/
-__pycache__/
 *.pyc
+__pycache__/
