@@ -7,7 +7,6 @@ from scraper.detail_page import DetailScrapeResult, DetailScrapeStatus
 from services.putusan_worker import ClaimedPutusan, PutusanWorker
 from services.run_finalizer_service import RunFinalizerService
 from database.session import SessionLocal
-from repositories.putusan_repository import get_status_counts_by_year
 
 
 TEST_YEAR = 2091
@@ -38,6 +37,7 @@ def seed_case() -> tuple[int, int, str]:
         putusan = Putusan(
             tahun=TEST_YEAR,
             halaman=1,
+            run_id=run.id,
             url_detail=PUTUSAN_URL,
             status_scraping=ScrapingStatus.PROCESSING,
             processing_worker_id="phase12-4-worker",

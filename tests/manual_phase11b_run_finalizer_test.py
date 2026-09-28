@@ -143,6 +143,7 @@ def main():
                 Putusan(
                     tahun=TEST_YEAR,
                     halaman=1,
+                    run_id=run_id,
                     url_detail=(
                         "https://example.test/"
                         "phase-11b-finalizer/putusan/1"

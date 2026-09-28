@@ -9,15 +9,22 @@ def main():
         "tahun/2021/page/2.html"
     )
 
+    page_3_url = (
+        "https://putusan3.mahkamahagung.go.id/"
+        "direktori/index/"
+        "tahunjenis/putus/"
+        "tahun/2021/page/3.html"
+    )
+
     print()
     print("=" * 70)
     print("PAGINATION URL TEMPLATE TEST")
     print("=" * 70)
 
     template = (
-        PaginationScraper._extract_page_url_template(
-            page_url=page_2_url,
-            page_number=2,
+        PaginationScraper._derive_page_url_template(
+            page_2_url=page_2_url,
+            page_3_url=page_3_url,
         )
     )
 
