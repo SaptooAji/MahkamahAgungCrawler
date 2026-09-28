@@ -6,7 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
 # Jalankan dari root project, misalnya:
-# ENV_FILE=.env.test python manual_putusan_6c_claim_idempotency_test.py
+# ENV_FILE=.env.test python -m tests.persistence.putusan_claim_idempotency_test
 
 from sqlalchemy import delete, select
 

@@ -1,95 +1,77 @@
 # Test Suite
 
 Folder ini berisi **manual/integration regression scripts**, bukan suite pytest
-konvensional. File tetap flat pada fase ini; grouping berdasarkan layer/domain
-akan dilakukan pada fase berikutnya.
+konvensional. Pada Phase 2, test dikelompokkan berdasarkan concern arsitektur,
+bukan berdasarkan urutan historis phase development.
 
-## Test yang dipertahankan
-
-### Claim, ownership, dan concurrency
+## Struktur
 
 ```text
-manual_claim_test.py
-manual_claim_by_id_test.py
-manual_concurrency_test.py
-manual_processing_token_test.py
-manual_putusan_6c_claim_idempotency_test.py
+tests/
+├── persistence/
+│   ├── claim_test.py
+│   ├── claim_by_id_test.py
+│   ├── claim_concurrency_test.py
+│   ├── processing_token_test.py
+│   ├── putusan_claim_idempotency_test.py
+│   ├── discovery_page_job_repository_test.py
+│   ├── discovery_page_job_repository_idempotency_test.py
+│   └── discovery_page_job_repository_concurrency_test.py
+├── services/
+│   ├── lifecycle_service_test.py
+│   ├── discovery_page_job_service_test.py
+│   ├── putusan_retry_lifecycle_test.py
+│   └── putusan_retry_recovery_test.py
+├── workers/
+│   ├── discovery_page_worker_test.py
+│   ├── detail_worker_lifecycle_test.py
+│   └── putusan_worker_retry_lifecycle_test.py
+├── orchestration/
+│   ├── multi_worker_concurrency_test.py
+│   ├── run_finalizer_test.py
+│   ├── discovery_worker_finalizer_test.py
+│   ├── dispatch_idempotency_test.py
+│   └── run_retry_lifecycle_test.py
+├── scraper/
+│   └── pagination_template_test.py
+└── live/
+    └── sequential_fallback_test_v2.py
 ```
 
-Memvalidasi claim, duplicate claim, ownership, processing token, dan concurrent
-access terhadap PostgreSQL.
+## Execution
 
-### Discovery page dan persistence
+Test yang menyentuh PostgreSQL menggunakan `.env.test` dan database test
+terisolasi. Test tersebut tidak membutuhkan Celery worker/Beat kecuali disebut
+sebaliknya.
 
-```text
-manual_discovery_page_job_repository_test.py
-manual_discovery_page_job_repository_idempotency_test.py
-manual_discovery_page_job_repository_concurrency_test.py
-manual_discovery_page_job_service_test.py
-manual_discovery_page_worker_test.py
+Contoh:
+
+```bash
+python -m tests.persistence.claim_by_id_test
+python -m tests.services.putusan_retry_lifecycle_test
+python -m tests.workers.detail_worker_lifecycle_test
+python -m tests.orchestration.run_finalizer_test
+python -m tests.scraper.pagination_template_test
 ```
 
-Memvalidasi page-job repository/service, idempotency, stale recovery, ownership,
-dan integrasi worker discovery.
+Test live website hanya dijalankan secara eksplisit:
 
-### Putusan lifecycle dan retry
-
-```text
-manual_lifecycle_service_test.py
-manual_phase9_putusan_retry_recovery_test.py
-manual_putusan_6e_retry_lifecycle_test.py
-manual_putusan_worker_12_4_retry_lifecycle_test.py
+```bash
+python -m tests.live.sequential_fallback_test_v2
 ```
 
-Memvalidasi lifecycle Putusan, retry scheduling, stale recovery, dan propagation
-retry melalui worker.
+Test live bersifat environment-dependent karena Cloudflare dan kondisi layanan
+dapat berbeda antar-run.
 
-### Run/orchestration
-
-```text
-manual_phase10_multi_worker_concurrency_test.py
-manual_phase11b_run_finalizer_test.py
-manual_phase12_discovery_worker_finalizer_test.py
-manual_phase13_dispatch_idempotency_test.py
-manual_phase13_run_retry_lifecycle_test.py
-```
-
-Memvalidasi concurrency lintas worker, run finalization, dispatch fencing,
-child-task ownership, dan lifecycle retry pada `ScrapingRun`.
-
-### Pagination
-
-```text
-manual_pagination_template_test.py
-manual_phase13_live_sequential_fallback_test_v2.py
-```
-
-Test pertama memvalidasi predictive URL template dan descriptor generation.
-Test Phase 13 v2 menjalankan sequential fallback pada website Mahkamah Agung
-secara live dengan browser visible dan checkpoint Cloudflare manual.
-
-## Canonical final acceptance
-
-Untuk verifikasi static/runtime contract:
+## Canonical acceptance
 
 ```bash
 python -m scripts.phase13_acceptance
-```
-
-Untuk verifikasi run E2E yang sudah selesai:
-
-```bash
 python -m scripts.phase13_acceptance --run-id "$RUN_ID"
 ```
 
-## Operational notes
+## Semantik failure
 
-Sebagian test manual menggunakan PostgreSQL dan dapat membuat/mengubah row test.
-Gunakan database test khusus dan `ENV_FILE` yang sesuai.
-
-Test live website bersifat nondeterministic terhadap kondisi eksternal seperti
-Cloudflare. Perbedaan hasil antar-run tidak otomatis berarti regression selama
-state, retry, ownership, dan invariant database tetap benar.
-
-`FAILED_PERMANENT` pada Putusan berarti retry untuk crawl tersebut exhausted,
-bukan jaminan bahwa dokumen di website selalu tidak tersedia.
+`FAILED_RETRY` berarti row/run masih eligible untuk retry. `FAILED_PERMANENT`
+berarti retry untuk crawl tersebut sudah exhausted; status itu bukan jaminan
+bahwa dokumen di website selalu tidak tersedia.

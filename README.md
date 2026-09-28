@@ -186,11 +186,11 @@ Cloudflare dan kondisi layanan dapat berbeda antar-run.
 
 ## Testing
 
-Test manual yang dipertahankan berada langsung di `tests/`. Saat ini folder
-belum dikelompokkan agar cleanup tidak sekaligus mengubah struktur test; phase
-berikutnya dapat melakukan grouping berdasarkan layer/domain.
+Test manual/integration regression dikelompokkan berdasarkan concern di dalam
+`tests/`: persistence, services, workers, orchestration, scraper, dan live.
+Nama file tidak lagi mengikuti nomor phase historis.
 
-Daftar dan tujuan test ada di [`tests/README.md`](tests/README.md).
+Daftar struktur dan cara menjalankan test ada di [`tests/README.md`](tests/README.md).
 
 ## Logging
 

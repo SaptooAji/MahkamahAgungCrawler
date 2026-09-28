@@ -2,7 +2,7 @@
 Manual validation for Phase 6E - Putusan retry lifecycle.
 
 Run from project root:
-    ENV_FILE=.env.test python -m tests.manual_putusan_6e_retry_lifecycle_test
+    ENV_FILE=.env.test python -m tests.services.putusan_retry_lifecycle_test
 """
 
 import os
