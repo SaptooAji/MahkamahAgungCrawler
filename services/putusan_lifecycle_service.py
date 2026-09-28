@@ -1,13 +1,16 @@
 from sqlalchemy.orm import Session
 
 from models.putusan import Putusan
+
 from repositories.putusan_repository import (
     claim_pending_putusan,
+    adopt_processing_putusan,
     claim_putusan_by_id,
     mark_putusan_failed_retry,
     mark_putusan_success,
     mark_putusan_unpublished,
     recover_stale_processing_putusan,
+    upsert_discovered_putusan,
 )
 
 
@@ -25,11 +28,28 @@ class PutusanLifecycleService:
         *,
         worker_id: str,
         batch_size: int = 10,
+        run_id: int | None = None,
     ) -> list[Putusan]:
         return claim_pending_putusan(
             session,
             worker_id=worker_id,
             batch_size=batch_size,
+            run_id=run_id,
+        )
+
+    def adopt_processing(
+        self,
+        session: Session,
+        *,
+        putusan_id: int,
+        dispatch_owner_id: str,
+        worker_id: str,
+    ) -> Putusan | None:
+        return adopt_processing_putusan(
+            session,
+            putusan_id=putusan_id,
+            dispatch_owner_id=dispatch_owner_id,
+            worker_id=worker_id,
         )
 
     def mark_success(
@@ -102,11 +122,35 @@ class PutusanLifecycleService:
         *,
         putusan_id: int,
         worker_id: str,
+        run_id: int | None = None,
     ) -> Putusan | None:
         return claim_putusan_by_id(
             session,
             putusan_id=putusan_id,
             worker_id=worker_id,
+            run_id=run_id,
         )
+
+    def upsert_discovered(
+        self,
+        session: Session,
+        *,
+        run_id: int | None = None,
+        tahun: int,
+        halaman: int | None,
+        url_detail: str,
+        judul: str | None = None,
+        is_unpublish: bool = False,
+    ) -> tuple[Putusan, bool]:
+        return upsert_discovered_putusan(
+            session,
+            run_id=run_id,
+            tahun=tahun,
+            halaman=halaman,
+            url_detail=url_detail,
+            judul=judul,
+            is_unpublish=is_unpublish,
+        )
+
 
 putusan_lifecycle_service = PutusanLifecycleService()

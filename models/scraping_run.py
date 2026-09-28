@@ -7,6 +7,9 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
 
+class PaginationMode(str, Enum):
+    PREDICTIVE = "PREDICTIVE"
+    SEQUENTIAL = "SEQUENTIAL"
 
 class ScrapingRunStatus(str, Enum):
     PENDING = "PENDING"
@@ -14,6 +17,9 @@ class ScrapingRunStatus(str, Enum):
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    DISCOVERY_COMPLETED = "DISCOVERY_COMPLETED"
+    FAILED_RETRY = "FAILED_RETRY"
+
 
 
 class ScrapingRun(Base):
@@ -69,6 +75,22 @@ class ScrapingRun(Base):
         default=0,
     )
 
+    retry_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    next_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    retry_dispatched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
     last_error: Mapped[str | None] = mapped_column(
         Text,
         nullable=True,
@@ -85,4 +107,19 @@ class ScrapingRun(Base):
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
         onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    total_pages: Mapped[int | None] = mapped_column(
+        Integer,
+        nullable=True,
+    )
+
+    pagination_mode: Mapped[PaginationMode | None] = mapped_column(
+        SQLEnum(PaginationMode),
+        nullable=True,
+    )
+
+    url_halaman_pertama: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
     )

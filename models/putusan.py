@@ -3,7 +3,7 @@ from enum import Enum
 from uuid import uuid4
 
 from sqlalchemy import BigInteger, DateTime, Enum as SQLEnum
-from sqlalchemy import Index, Integer, Text
+from sqlalchemy import ForeignKey, Index, Integer, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base
@@ -26,12 +26,24 @@ class Putusan(Base):
                 "ix_putusan_status_scraping",
                 "status_scraping",
             ),
+            Index(
+                "ix_putusan_run_status_retry",
+                "run_id",
+                "status_scraping",
+                "next_retry_at",
+                "id",
+            ),
         )
     
     id: Mapped[int] = mapped_column(
         BigInteger,
         primary_key=True,
         autoincrement=True,
+    )
+
+    run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("scraping_runs.id", ondelete="SET NULL"),
+        nullable=True,
     )
 
     tahun: Mapped[int] = mapped_column(
