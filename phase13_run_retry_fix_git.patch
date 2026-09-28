@@ -1,0 +1,602 @@
+--- a/models/scraping_run.py
++++ b/models/scraping_run.py
+@@ -18,6 +18,7 @@
+     FAILED = "FAILED"
+     CANCELLED = "CANCELLED"
+     DISCOVERY_COMPLETED = "DISCOVERY_COMPLETED"
++    FAILED_RETRY = "FAILED_RETRY"
+ 
+ 
+ 
+@@ -74,6 +75,22 @@
+         default=0,
+     )
+ 
++    retry_count: Mapped[int] = mapped_column(
++        Integer,
++        nullable=False,
++        default=0,
++    )
++
++    next_retry_at: Mapped[datetime | None] = mapped_column(
++        DateTime(timezone=True),
++        nullable=True,
++    )
++
++    retry_dispatched_at: Mapped[datetime | None] = mapped_column(
++        DateTime(timezone=True),
++        nullable=True,
++    )
++
+     last_error: Mapped[str | None] = mapped_column(
+         Text,
+         nullable=True,
+
+--- a/scraper/pagination.py
++++ b/scraper/pagination.py
+@@ -5,6 +5,10 @@
+ from dataclasses import dataclass
+ from enum import Enum
+ from urllib.parse import urljoin, urlparse
++
++
++class PaginationRetryableError(RuntimeError):
++    """Transient discovery failure that can be retried by the run orchestrator."""
+ 
+ 
+ class PaginationMode(str, Enum):
+@@ -678,7 +682,7 @@
+                 return candidate_url, page
+ 
+             if status == "CLOUDFLARE_CHALLENGE":
+-                raise RuntimeError(
++                raise PaginationRetryableError(
+                     "Cloudflare challenge masih aktif "
+                     f"pada URL {candidate_url!r}. "
+                     f"title={health.get('title')!r}"
+@@ -927,14 +931,14 @@
+             status = health.get("status")
+ 
+             if status == "CLOUDFLARE_CHALLENGE":
+-                raise RuntimeError(
++                raise PaginationRetryableError(
+                     "Cloudflare challenge pada sequential page "
+                     f"{next_page_number}: {next_url!r}; "
+                     f"title={health.get('title')!r}"
+                 )
+ 
+             if status == "RETRYABLE_ERROR":
+-                raise RuntimeError(
++                raise PaginationRetryableError(
+                     "Retryable server/application error pada "
+                     f"sequential page {next_page_number}: "
+                     f"{next_url!r}; "
+
+--- a/services/discovery_run_service.py
++++ b/services/discovery_run_service.py
+@@ -1,7 +1,7 @@
+ 
+ from __future__ import annotations
+ 
+-from datetime import datetime, timezone
++from datetime import datetime, timedelta, timezone
+ 
+ from sqlalchemy.orm import Session
+ from sqlalchemy import select
+@@ -65,6 +65,7 @@
+             ScrapingRunStatus.PENDING,
+             ScrapingRunStatus.RUNNING,
+             ScrapingRunStatus.DISCOVERY_COMPLETED,
++            ScrapingRunStatus.FAILED_RETRY,
+         )
+ 
+         existing_run = session.scalar(
+@@ -145,15 +146,55 @@
+             if run is None:
+                 return None
+ 
+-            if run.status != ScrapingRunStatus.PENDING:
++            now = datetime.now(timezone.utc)
++
++            if run.status == ScrapingRunStatus.FAILED_RETRY:
++                if run.next_retry_at is not None and run.next_retry_at > now:
++                    return None
++            elif run.status != ScrapingRunStatus.PENDING:
+                 return None
+ 
+             run.status = ScrapingRunStatus.RUNNING
+-            run.started_at = datetime.now(timezone.utc)
++            run.started_at = run.started_at or now
++            run.next_retry_at = None
++            run.retry_dispatched_at = None
+ 
+             session.flush()
+ 
+             return run
++
++    def mark_retryable_failure(
++        self,
++        session: Session,
++        *,
++        run_id: int,
++        error_message: str,
++        retry_delay_seconds: int = 300,
++        max_retries: int = 3,
++    ) -> ScrapingRun:
++        run = session.get(ScrapingRun, run_id)
++        if run is None:
++            raise RuntimeError(f"ScrapingRun {run_id} tidak ditemukan.")
++
++        now = datetime.now(timezone.utc)
++        next_retry_count = run.retry_count + 1
++        run.last_error = error_message
++
++        if next_retry_count >= max_retries:
++            run.retry_count = min(next_retry_count, max_retries)
++            run.status = ScrapingRunStatus.FAILED
++            run.next_retry_at = None
++            run.retry_dispatched_at = None
++            run.finished_at = now
++        else:
++            run.retry_count = next_retry_count
++            run.status = ScrapingRunStatus.FAILED_RETRY
++            run.next_retry_at = now + timedelta(seconds=retry_delay_seconds)
++            run.retry_dispatched_at = None
++            run.finished_at = None
++
++        session.flush()
++        return run
+ 
+     async def discover_pagination(
+         self,
+
+--- a/services/run_finalizer_service.py
++++ b/services/run_finalizer_service.py
+@@ -26,6 +26,7 @@
+             ScrapingRunStatus.COMPLETED,
+             ScrapingRunStatus.FAILED,
+             ScrapingRunStatus.CANCELLED,
++            ScrapingRunStatus.FAILED_RETRY,
+         ):
+             return run
+ 
+
+--- a/celery_app/tasks.py
++++ b/celery_app/tasks.py
+@@ -5,12 +5,13 @@
+ import os
+ import socket
+ from dataclasses import asdict
+-from datetime import datetime, timezone
++from datetime import datetime, timedelta, timezone
+ 
+ import nodriver as uc
+ from sqlalchemy import func, select
+ from celery_app.celery import celery_app
+ from database.session import SessionLocal
++from scraper.pagination import PaginationRetryableError
+ from scraper.detail_page import (
+     DetailPageScraper,
+     build_detail_page_scraper,
+@@ -34,6 +35,11 @@
+ 
+ 
+ logger = logging.getLogger(f"celery.{__name__}")
++
++
++RUN_RETRY_DELAY_SECONDS = int(
++    os.getenv("SCRAPING_RUN_RETRY_DELAY_SECONDS", "300")
++)
+ 
+ 
+ def get_worker_id() -> str:
+@@ -841,6 +847,42 @@
+             worker_id,
+         )
+ 
++    except PaginationRetryableError as exc:
++        logger.warning(
++            "SCRAPING_RUN_RETRY "
++            "run_id=%s worker_id=%s error=%s",
++            claimed_run_id,
++            worker_id,
++            exc,
++        )
++
++        with SessionLocal.begin() as session:
++            run = discovery_run_service.mark_retryable_failure(
++                session,
++                run_id=claimed_run_id,
++                error_message=str(exc),
++                retry_delay_seconds=RUN_RETRY_DELAY_SECONDS,
++            )
++
++            logger.info(
++                "SCRAPING_RUN_RETRY_STATE "
++                "run_id=%s status=%s retry_count=%s next_retry_at=%s",
++                run.id,
++                run.status.value,
++                run.retry_count,
++                run.next_retry_at,
++            )
++
++        return {
++            "run_id": claimed_run_id,
++            "status": run.status.value,
++            "retry_count": run.retry_count,
++            "next_retry_at": run.next_retry_at.isoformat()
++            if run.next_retry_at is not None
++            else None,
++            "reason": "retryable_discovery_error",
++        }
++
+     except Exception as exc:
+         logger.exception(
+             "SCRAPING_RUN_ERROR "
+@@ -848,8 +890,6 @@
+             claimed_run_id,
+             worker_id,
+         )
+-
+-        # Mark FAILED dalam transaction terpisah.
+ 
+         with SessionLocal.begin() as session:
+             run = session.get(
+@@ -973,13 +1013,43 @@
+             ).all()
+         )
+ 
++        now = datetime.now(timezone.utc)
++        dispatch_fence_cutoff = now - timedelta(seconds=120)
++
++        retryable_runs = list(
++            session.scalars(
++                select(ScrapingRun).where(
++                    ScrapingRun.status == ScrapingRunStatus.FAILED_RETRY,
++                    (
++                        ScrapingRun.next_retry_at.is_(None)
++                        | (ScrapingRun.next_retry_at <= now)
++                    ),
++                    (
++                        ScrapingRun.retry_dispatched_at.is_(None)
++                        | (ScrapingRun.retry_dispatched_at <= dispatch_fence_cutoff)
++                    ),
++                )
++                .with_for_update(skip_locked=True)
++            ).all()
++        )
++
++        for run in retryable_runs:
++            run.retry_dispatched_at = now
++
+         run_ids = [run.id for run in active_runs]
+-
+-        # Finalizer setelah recovery dapat langsung menutup run yang
+-        # ternyata sudah terminal.
++        retry_run_ids = [run.id for run in retryable_runs]
++
+         finalizer = RunFinalizerService()
+         for run in active_runs:
+             finalizer.try_finalize(session, run=run)
++
++    scheduled_run_retries = []
++    for run_id in retry_run_ids:
++        task = process_scraping_run.delay(run_id)
++        scheduled_run_retries.append({
++            "run_id": run_id,
++            "task_id": task.id,
++        })
+ 
+     scheduled_discovery = []
+     scheduled_putusan = []
+@@ -1041,9 +1111,10 @@
+ 
+     logger.info(
+         "MAINTENANCE_TICK recovered_putusan=%s recovered_pages=%s "
+-        "scheduled_discovery=%s scheduled_putusan=%s",
++        "scheduled_run_retries=%s scheduled_discovery=%s scheduled_putusan=%s",
+         recovered_putusan,
+         recovered_pages,
++        len(scheduled_run_retries),
+         len(scheduled_discovery),
+         len(scheduled_putusan),
+     )
+@@ -1051,6 +1122,7 @@
+     return {
+         "recovered_putusan": recovered_putusan,
+         "recovered_pages": recovered_pages,
++        "scheduled_run_retries": scheduled_run_retries,
+         "scheduled_discovery": scheduled_discovery,
+         "scheduled_putusan": scheduled_putusan,
+     }
+
+--- a/scripts/phase13_acceptance.py
++++ b/scripts/phase13_acceptance.py
+@@ -113,11 +113,22 @@
+         DiscoveryPageJobStatus,
+     )
+     from models.putusan import Putusan, ScrapingStatus
+-    from models.scraping_run import ScrapingRun
++    from models.scraping_run import ScrapingRun, ScrapingRunStatus
+ 
+     with SessionLocal() as session:
+         run = session.get(ScrapingRun, run_id)
+         assert run is not None, f"run_id={run_id} tidak ditemukan"
++        assert run.status in (
++            ScrapingRunStatus.COMPLETED,
++            ScrapingRunStatus.FAILED,
++            ScrapingRunStatus.CANCELLED,
++        ), (
++            f"run_id={run_id} belum terminal: "
++            f"status={run.status.value} "
++            f"retry_count={run.retry_count} "
++            f"next_retry_at={run.next_retry_at}"
++        )
++        assert run.retry_count <= 3, run.retry_count
+ 
+         processing_putusan = session.scalar(
+             select(func.count(Putusan.id)).where(
+
+--- a/alembic/versions/phase13_add_scraping_run_retry.py
++++ b/alembic/versions/phase13_add_scraping_run_retry.py
+@@ -0,0 +1,52 @@
++"""add scraping run retry lifecycle
++
++Revision ID: phase13runretry
++Revises: phase13runidx
++Create Date: 2026-09-28
++"""
++
++from typing import Sequence, Union
++
++from alembic import op
++import sqlalchemy as sa
++
++
++revision: str = "phase13runretry"
++down_revision: Union[str, Sequence[str], None] = "phase13runidx"
++branch_labels = None
++depends_on = None
++
++
++def upgrade() -> None:
++    op.add_column(
++        "scraping_runs",
++        sa.Column("retry_count", sa.Integer(), nullable=False, server_default="0"),
++    )
++    op.add_column(
++        "scraping_runs",
++        sa.Column("next_retry_at", sa.DateTime(timezone=True), nullable=True),
++    )
++    op.add_column(
++        "scraping_runs",
++        sa.Column("retry_dispatched_at", sa.DateTime(timezone=True), nullable=True),
++    )
++
++    op.execute(
++        "ALTER TYPE scrapingrunstatus ADD VALUE IF NOT EXISTS 'FAILED_RETRY'"
++    )
++
++    op.create_index(
++        "ix_scraping_runs_status_retry",
++        "scraping_runs",
++        ["status", "next_retry_at", "retry_dispatched_at", "id"],
++    )
++
++
++def downgrade() -> None:
++    op.drop_index(
++        "ix_scraping_runs_status_retry",
++        table_name="scraping_runs",
++    )
++    op.drop_column("scraping_runs", "retry_dispatched_at")
++    op.drop_column("scraping_runs", "next_retry_at")
++    op.drop_column("scraping_runs", "retry_count")
+
+--- a/tests/manual_phase13_run_retry_lifecycle_test.py
++++ b/tests/manual_phase13_run_retry_lifecycle_test.py
+@@ -0,0 +1,204 @@
++from __future__ import annotations
++
++import os
++from datetime import datetime, timedelta, timezone
++from unittest.mock import patch
++
++from dotenv import load_dotenv
++from sqlalchemy import delete, select
++
++load_dotenv(os.getenv("ENV_FILE", ".env"))
++
++from database.session import SessionLocal
++from celery_app.tasks import maintenance_tick
++from models.scraping_run import ScrapingRun, ScrapingRunStatus
++from services.discovery_run_service import discovery_run_service
++from services.run_finalizer_service import RunFinalizerService
++
++TEST_YEAR = 2197
++TEST_URL = "https://example.invalid/phase13/run-retry"
++
++
++def utcnow() -> datetime:
++    return datetime.now(timezone.utc)
++
++
++def create_run() -> int:
++    with SessionLocal.begin() as session:
++        session.execute(
++            delete(ScrapingRun).where(ScrapingRun.tahun == TEST_YEAR)
++        )
++        run = discovery_run_service.create_run(
++            session,
++            tahun=TEST_YEAR,
++            url_halaman_pertama=TEST_URL,
++        )
++        return run.id
++
++
++def snapshot(run_id: int) -> dict:
++    with SessionLocal() as session:
++        run = session.get(ScrapingRun, run_id)
++        assert run is not None
++        return {
++            "status": run.status.value,
++            "retry_count": run.retry_count,
++            "next_retry_at": run.next_retry_at,
++            "retry_dispatched_at": run.retry_dispatched_at,
++            "last_error": run.last_error,
++        }
++
++
++def cleanup(run_id: int) -> None:
++    with SessionLocal.begin() as session:
++        session.execute(
++            delete(ScrapingRun).where(ScrapingRun.id == run_id)
++        )
++
++
++def main() -> int:
++    run_id = create_run()
++
++    try:
++        # 13R.1 Initial claim must work.
++        with SessionLocal.begin() as session:
++            claimed = discovery_run_service.claim_run(
++                session,
++                run_id=run_id,
++            )
++            assert claimed is not None
++            assert claimed.status == ScrapingRunStatus.RUNNING
++        print("13R.1 ScrapingRun initial claim: PASS")
++
++        # 13R.2 First retryable failure is persisted.
++        with SessionLocal.begin() as session:
++            run = discovery_run_service.mark_retryable_failure(
++                session,
++                run_id=run_id,
++                error_message="Cloudflare challenge masih aktif",
++                retry_delay_seconds=300,
++            )
++            assert run.status == ScrapingRunStatus.FAILED_RETRY
++            assert run.retry_count == 1
++            assert run.next_retry_at is not None
++            assert run.next_retry_at > utcnow()
++            assert run.retry_dispatched_at is None
++        print("13R.2 First discovery retry state: PASS")
++
++        # 13R.3 Finalizer must not turn FAILED_RETRY into COMPLETED.
++        with SessionLocal.begin() as session:
++            run = session.get(ScrapingRun, run_id)
++            assert run is not None
++            before = run.status
++            RunFinalizerService().try_finalize(session, run=run)
++            session.flush()
++            assert run.status == before == ScrapingRunStatus.FAILED_RETRY
++        print("13R.3 FAILED_RETRY protected from finalization: PASS")
++
++        # Make retry due and verify claim is blocked before due, then allowed after due.
++        with SessionLocal.begin() as session:
++            run = session.get(ScrapingRun, run_id)
++            assert run is not None
++            run.next_retry_at = utcnow() + timedelta(seconds=60)
++
++        with SessionLocal.begin() as session:
++            early = discovery_run_service.claim_run(session, run_id=run_id)
++            assert early is None
++        print("13R.4 Early retry claim blocked by next_retry_at: PASS")
++
++        with SessionLocal.begin() as session:
++            run = session.get(ScrapingRun, run_id)
++            assert run is not None
++            run.next_retry_at = utcnow() - timedelta(seconds=1)
++
++        with SessionLocal.begin() as session:
++            claimed = discovery_run_service.claim_run(
++                session,
++                run_id=run_id,
++            )
++            assert claimed is not None
++            assert claimed.status == ScrapingRunStatus.RUNNING
++            assert claimed.next_retry_at is None
++            assert claimed.retry_dispatched_at is None
++        print("13R.5 Due retry can be reclaimed: PASS")
++
++        # 13R.6 Attempts 2 and 3, where attempt 3 becomes terminal.
++        with SessionLocal.begin() as session:
++            run = discovery_run_service.mark_retryable_failure(
++                session,
++                run_id=run_id,
++                error_message="retryable-2",
++            )
++            assert run.status == ScrapingRunStatus.FAILED_RETRY
++            assert run.retry_count == 2
++
++        with SessionLocal.begin() as session:
++            run = session.get(ScrapingRun, run_id)
++            assert run is not None
++            run.next_retry_at = utcnow() - timedelta(seconds=1)
++
++        with SessionLocal.begin() as session:
++            claimed = discovery_run_service.claim_run(session, run_id=run_id)
++            assert claimed is not None
++
++        with SessionLocal.begin() as session:
++            run = discovery_run_service.mark_retryable_failure(
++                session,
++                run_id=run_id,
++                error_message="retryable-3",
++            )
++            assert run.status == ScrapingRunStatus.FAILED
++            assert run.retry_count == 3
++            assert run.next_retry_at is None
++            assert run.finished_at is not None
++        print("13R.6 Third retry becomes terminal FAILED: PASS")
++
++        # 13R.7 Maintenance DB fence: one due run is scheduled once.
++        with SessionLocal.begin() as session:
++            run = session.get(ScrapingRun, run_id)
++            assert run is not None
++            run.status = ScrapingRunStatus.FAILED_RETRY
++            run.retry_count = 1
++            run.next_retry_at = utcnow() - timedelta(seconds=1)
++            run.retry_dispatched_at = None
++            run.finished_at = None
++
++        class FakeAsyncResult:
++            id = "phase13-run-retry-task"
++
++        with patch(
++            "celery_app.tasks.process_scraping_run.delay",
++            return_value=FakeAsyncResult(),
++        ) as mocked_delay:
++            result = maintenance_tick.run()
++            assert len(result["scheduled_run_retries"]) == 1
++            assert result["scheduled_run_retries"][0]["run_id"] == run_id
++            mocked_delay.assert_called_once_with(run_id)
++
++        with SessionLocal() as session:
++            run = session.get(ScrapingRun, run_id)
++            assert run is not None
++            assert run.retry_dispatched_at is not None
++
++        print("13R.7 Maintenance run-retry DB dispatch fence: PASS")
++
++        with patch(
++            "celery_app.tasks.process_scraping_run.delay",
++            return_value=FakeAsyncResult(),
++        ) as mocked_delay:
++            result = maintenance_tick.run()
++            assert result["scheduled_run_retries"] == []
++            mocked_delay.assert_not_called()
++        print("13R.8 Duplicate maintenance tick does not re-dispatch: PASS")
++
++        print()
++        print("=" * 70)
++        print("PHASE 13 RUN RETRY LIFECYCLE: PASS")
++        print("=" * 70)
++        return 0
++    finally:
++        cleanup(run_id)
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

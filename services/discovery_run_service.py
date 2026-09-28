@@ -1,7 +1,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 from sqlalchemy import select
@@ -65,6 +65,7 @@ class DiscoveryRunService:
             ScrapingRunStatus.PENDING,
             ScrapingRunStatus.RUNNING,
             ScrapingRunStatus.DISCOVERY_COMPLETED,
+            ScrapingRunStatus.FAILED_RETRY,
         )
 
         existing_run = session.scalar(
@@ -145,15 +146,55 @@ class DiscoveryRunService:
             if run is None:
                 return None
 
-            if run.status != ScrapingRunStatus.PENDING:
+            now = datetime.now(timezone.utc)
+
+            if run.status == ScrapingRunStatus.FAILED_RETRY:
+                if run.next_retry_at is not None and run.next_retry_at > now:
+                    return None
+            elif run.status != ScrapingRunStatus.PENDING:
                 return None
 
             run.status = ScrapingRunStatus.RUNNING
-            run.started_at = datetime.now(timezone.utc)
+            run.started_at = run.started_at or now
+            run.next_retry_at = None
+            run.retry_dispatched_at = None
 
             session.flush()
 
             return run
+
+    def mark_retryable_failure(
+        self,
+        session: Session,
+        *,
+        run_id: int,
+        error_message: str,
+        retry_delay_seconds: int = 300,
+        max_retries: int = 3,
+    ) -> ScrapingRun:
+        run = session.get(ScrapingRun, run_id)
+        if run is None:
+            raise RuntimeError(f"ScrapingRun {run_id} tidak ditemukan.")
+
+        now = datetime.now(timezone.utc)
+        next_retry_count = run.retry_count + 1
+        run.last_error = error_message
+
+        if next_retry_count >= max_retries:
+            run.retry_count = min(next_retry_count, max_retries)
+            run.status = ScrapingRunStatus.FAILED
+            run.next_retry_at = None
+            run.retry_dispatched_at = None
+            run.finished_at = now
+        else:
+            run.retry_count = next_retry_count
+            run.status = ScrapingRunStatus.FAILED_RETRY
+            run.next_retry_at = now + timedelta(seconds=retry_delay_seconds)
+            run.retry_dispatched_at = None
+            run.finished_at = None
+
+        session.flush()
+        return run
 
     async def discover_pagination(
         self,

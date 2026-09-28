@@ -113,11 +113,22 @@ def check_database(run_id: int) -> None:
         DiscoveryPageJobStatus,
     )
     from models.putusan import Putusan, ScrapingStatus
-    from models.scraping_run import ScrapingRun
+    from models.scraping_run import ScrapingRun, ScrapingRunStatus
 
     with SessionLocal() as session:
         run = session.get(ScrapingRun, run_id)
         assert run is not None, f"run_id={run_id} tidak ditemukan"
+        assert run.status in (
+            ScrapingRunStatus.COMPLETED,
+            ScrapingRunStatus.FAILED,
+            ScrapingRunStatus.CANCELLED,
+        ), (
+            f"run_id={run_id} belum terminal: "
+            f"status={run.status.value} "
+            f"retry_count={run.retry_count} "
+            f"next_retry_at={run.next_retry_at}"
+        )
+        assert run.retry_count <= 3, run.retry_count
 
         processing_putusan = session.scalar(
             select(func.count(Putusan.id)).where(

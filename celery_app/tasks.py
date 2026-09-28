@@ -5,12 +5,13 @@ import logging
 import os
 import socket
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import nodriver as uc
 from sqlalchemy import func, select
 from celery_app.celery import celery_app
 from database.session import SessionLocal
+from scraper.pagination import PaginationRetryableError
 from scraper.detail_page import (
     DetailPageScraper,
     build_detail_page_scraper,
@@ -34,6 +35,11 @@ from services.discovery_run_service import discovery_run_service
 
 
 logger = logging.getLogger(f"celery.{__name__}")
+
+
+RUN_RETRY_DELAY_SECONDS = int(
+    os.getenv("SCRAPING_RUN_RETRY_DELAY_SECONDS", "300")
+)
 
 
 def get_worker_id() -> str:
@@ -841,6 +847,42 @@ async def _process_scraping_run(
             worker_id,
         )
 
+    except PaginationRetryableError as exc:
+        logger.warning(
+            "SCRAPING_RUN_RETRY "
+            "run_id=%s worker_id=%s error=%s",
+            claimed_run_id,
+            worker_id,
+            exc,
+        )
+
+        with SessionLocal.begin() as session:
+            run = discovery_run_service.mark_retryable_failure(
+                session,
+                run_id=claimed_run_id,
+                error_message=str(exc),
+                retry_delay_seconds=RUN_RETRY_DELAY_SECONDS,
+            )
+
+            logger.info(
+                "SCRAPING_RUN_RETRY_STATE "
+                "run_id=%s status=%s retry_count=%s next_retry_at=%s",
+                run.id,
+                run.status.value,
+                run.retry_count,
+                run.next_retry_at,
+            )
+
+        return {
+            "run_id": claimed_run_id,
+            "status": run.status.value,
+            "retry_count": run.retry_count,
+            "next_retry_at": run.next_retry_at.isoformat()
+            if run.next_retry_at is not None
+            else None,
+            "reason": "retryable_discovery_error",
+        }
+
     except Exception as exc:
         logger.exception(
             "SCRAPING_RUN_ERROR "
@@ -848,8 +890,6 @@ async def _process_scraping_run(
             claimed_run_id,
             worker_id,
         )
-
-        # Mark FAILED dalam transaction terpisah.
 
         with SessionLocal.begin() as session:
             run = session.get(
@@ -973,13 +1013,43 @@ def maintenance_tick() -> dict:
             ).all()
         )
 
-        run_ids = [run.id for run in active_runs]
+        now = datetime.now(timezone.utc)
+        dispatch_fence_cutoff = now - timedelta(seconds=120)
 
-        # Finalizer setelah recovery dapat langsung menutup run yang
-        # ternyata sudah terminal.
+        retryable_runs = list(
+            session.scalars(
+                select(ScrapingRun).where(
+                    ScrapingRun.status == ScrapingRunStatus.FAILED_RETRY,
+                    (
+                        ScrapingRun.next_retry_at.is_(None)
+                        | (ScrapingRun.next_retry_at <= now)
+                    ),
+                    (
+                        ScrapingRun.retry_dispatched_at.is_(None)
+                        | (ScrapingRun.retry_dispatched_at <= dispatch_fence_cutoff)
+                    ),
+                )
+                .with_for_update(skip_locked=True)
+            ).all()
+        )
+
+        for run in retryable_runs:
+            run.retry_dispatched_at = now
+
+        run_ids = [run.id for run in active_runs]
+        retry_run_ids = [run.id for run in retryable_runs]
+
         finalizer = RunFinalizerService()
         for run in active_runs:
             finalizer.try_finalize(session, run=run)
+
+    scheduled_run_retries = []
+    for run_id in retry_run_ids:
+        task = process_scraping_run.delay(run_id)
+        scheduled_run_retries.append({
+            "run_id": run_id,
+            "task_id": task.id,
+        })
 
     scheduled_discovery = []
     scheduled_putusan = []
@@ -1041,9 +1111,10 @@ def maintenance_tick() -> dict:
 
     logger.info(
         "MAINTENANCE_TICK recovered_putusan=%s recovered_pages=%s "
-        "scheduled_discovery=%s scheduled_putusan=%s",
+        "scheduled_run_retries=%s scheduled_discovery=%s scheduled_putusan=%s",
         recovered_putusan,
         recovered_pages,
+        len(scheduled_run_retries),
         len(scheduled_discovery),
         len(scheduled_putusan),
     )
@@ -1051,6 +1122,7 @@ def maintenance_tick() -> dict:
     return {
         "recovered_putusan": recovered_putusan,
         "recovered_pages": recovered_pages,
+        "scheduled_run_retries": scheduled_run_retries,
         "scheduled_discovery": scheduled_discovery,
         "scheduled_putusan": scheduled_putusan,
     }

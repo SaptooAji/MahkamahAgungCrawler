@@ -7,6 +7,10 @@ from enum import Enum
 from urllib.parse import urljoin, urlparse
 
 
+class PaginationRetryableError(RuntimeError):
+    """Transient discovery failure that can be retried by the run orchestrator."""
+
+
 class PaginationMode(str, Enum):
     PREDICTIVE = "PREDICTIVE"
     SEQUENTIAL = "SEQUENTIAL"
@@ -678,7 +682,7 @@ class PaginationScraper:
                 return candidate_url, page
 
             if status == "CLOUDFLARE_CHALLENGE":
-                raise RuntimeError(
+                raise PaginationRetryableError(
                     "Cloudflare challenge masih aktif "
                     f"pada URL {candidate_url!r}. "
                     f"title={health.get('title')!r}"
@@ -927,14 +931,14 @@ class PaginationScraper:
             status = health.get("status")
 
             if status == "CLOUDFLARE_CHALLENGE":
-                raise RuntimeError(
+                raise PaginationRetryableError(
                     "Cloudflare challenge pada sequential page "
                     f"{next_page_number}: {next_url!r}; "
                     f"title={health.get('title')!r}"
                 )
 
             if status == "RETRYABLE_ERROR":
-                raise RuntimeError(
+                raise PaginationRetryableError(
                     "Retryable server/application error pada "
                     f"sequential page {next_page_number}: "
                     f"{next_url!r}; "

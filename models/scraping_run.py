@@ -18,6 +18,7 @@ class ScrapingRunStatus(str, Enum):
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     DISCOVERY_COMPLETED = "DISCOVERY_COMPLETED"
+    FAILED_RETRY = "FAILED_RETRY"
 
 
 
@@ -72,6 +73,22 @@ class ScrapingRun(Base):
         Integer,
         nullable=False,
         default=0,
+    )
+
+    retry_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    next_retry_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    retry_dispatched_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )
 
     last_error: Mapped[str | None] = mapped_column(

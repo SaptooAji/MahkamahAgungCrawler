@@ -26,6 +26,7 @@ class RunFinalizerService:
             ScrapingRunStatus.COMPLETED,
             ScrapingRunStatus.FAILED,
             ScrapingRunStatus.CANCELLED,
+            ScrapingRunStatus.FAILED_RETRY,
         ):
             return run
 
