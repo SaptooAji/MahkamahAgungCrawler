@@ -312,6 +312,32 @@ def recover_stale_processing_putusan(
     return len(putusan_list)
 
 
+def adopt_processing_putusan(
+    session: Session,
+    *,
+    putusan_id: int,
+    dispatch_owner_id: str,
+    worker_id: str,
+) -> Putusan | None:
+    """Fence duplicate Celery deliveries and transfer the lease to the worker."""
+    putusan = session.scalar(
+        select(Putusan)
+        .where(
+            Putusan.id == putusan_id,
+            Putusan.status_scraping == ScrapingStatus.PROCESSING,
+            Putusan.processing_worker_id == dispatch_owner_id,
+            Putusan.processing_token.is_not(None),
+        )
+        .with_for_update(skip_locked=True)
+    )
+
+    if putusan is None:
+        return None
+
+    putusan.processing_worker_id = worker_id
+    session.flush()
+    return putusan
+
 def claim_putusan_by_id(
     session: Session,
     *,

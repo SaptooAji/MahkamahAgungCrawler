@@ -4,6 +4,7 @@ from models.putusan import Putusan
 
 from repositories.putusan_repository import (
     claim_pending_putusan,
+    adopt_processing_putusan,
     claim_putusan_by_id,
     mark_putusan_failed_retry,
     mark_putusan_success,
@@ -34,6 +35,21 @@ class PutusanLifecycleService:
             worker_id=worker_id,
             batch_size=batch_size,
             run_id=run_id,
+        )
+
+    def adopt_processing(
+        self,
+        session: Session,
+        *,
+        putusan_id: int,
+        dispatch_owner_id: str,
+        worker_id: str,
+    ) -> Putusan | None:
+        return adopt_processing_putusan(
+            session,
+            putusan_id=putusan_id,
+            dispatch_owner_id=dispatch_owner_id,
+            worker_id=worker_id,
         )
 
     def mark_success(

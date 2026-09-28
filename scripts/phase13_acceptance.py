@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import inspect
 
 from scraper.pagination import PaginationMode, PaginationScraper
 from celery_app.celery import celery_app
@@ -77,6 +78,31 @@ def check_celery_schedule() -> None:
     assert entry["task"] == "maintenance.tick"
     assert float(entry["schedule"]) == 30.0
     print("PASS Celery Beat maintenance schedule: 30s")
+
+
+def check_orchestration_contract() -> None:
+    from celery_app import tasks as task_module
+
+    registered = set(task_module.celery_app.tasks.keys())
+
+    assert "discovery_page.dispatch_pending" not in registered
+    assert "discovery_page.dispatch_batch" in registered
+    assert "discovery_page.process_batch" in registered
+    assert "putusan.dispatch_pending" in registered
+
+    source = inspect.getsource(task_module)
+    assert "from celery import chord" not in source
+
+    discovery_batch_source = inspect.getsource(
+        task_module.process_discovery_page_batch.run
+        if hasattr(task_module.process_discovery_page_batch, "run")
+        else task_module.process_discovery_page_batch
+    )
+    assert "process_discovery_page_batch.delay(" not in discovery_batch_source
+
+    assert "pg_advisory_xact_lock" in source
+
+    print("PASS orchestration contract: single scheduler + DB dispatch fence")
 
 
 def check_database(run_id: int) -> None:
@@ -161,6 +187,7 @@ def main() -> None:
 
     check_sequential_pagination()
     check_celery_schedule()
+    check_orchestration_contract()
 
     if args.run_id is not None:
         check_database(args.run_id)

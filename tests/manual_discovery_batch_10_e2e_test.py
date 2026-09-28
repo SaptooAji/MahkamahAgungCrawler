@@ -148,12 +148,11 @@ def main() -> int:
     print()
 
     # --------------------------------------------------------
-    # Dispatch exactly ONE first batch. The Celery task itself
-    # is responsible for scheduling the next batch automatically.
+    # Dispatch exactly ONE first batch. The Celery Beat maintenance tick is responsible for scheduling the next batch.
     # --------------------------------------------------------
-    async_result = dispatch_pending_discovery_page.delay(BATCH_SIZE)
+    async_result = dispatch_pending_discovery_page.delay(BATCH_SIZE, run_id=run_id)
     print(f"First Celery task: {async_result.id}")
-    print("Waiting for automatic batch chaining...")
+    print("Waiting for Beat-driven next-batch scheduling...")
     print()
 
     deadline = time.monotonic() + TIMEOUT_SECONDS

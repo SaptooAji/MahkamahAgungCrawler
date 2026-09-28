@@ -74,6 +74,38 @@ class DiscoveryPageWorker:
                 url_page=page_job.url_page,
             )
 
+    def adopt_claimed(
+        self,
+        *,
+        page_job_id: int,
+        dispatch_owner_id: str,
+        worker_id: str,
+    ) -> ClaimedDiscoveryPage | None:
+        with SessionLocal.begin() as session:
+            page_job = discovery_page_job_service.adopt_processing(
+                session,
+                page_job_id=page_job_id,
+                dispatch_owner_id=dispatch_owner_id,
+                worker_id=worker_id,
+            )
+
+            if page_job is None:
+                return None
+
+            if not page_job.processing_token:
+                raise RuntimeError(
+                    f"DiscoveryPageJob {page_job_id} adopted but processing_token kosong."
+                )
+
+            return ClaimedDiscoveryPage(
+                page_job_id=page_job.id,
+                processing_token=page_job.processing_token,
+                run_id=page_job.run_id,
+                page_number=page_job.page_number,
+                tahun=page_job.tahun,
+                url_page=page_job.url_page,
+            )
+
     async def process_claimed(
         self,
         browser,

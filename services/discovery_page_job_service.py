@@ -3,6 +3,8 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from repositories.discovery_page_job_repository import (
+    claim_pending_page_jobs,
+    adopt_processing_page_job,
     claim_page_job_by_id,
     create_page_jobs,
     mark_page_failed_retry,
@@ -60,6 +62,36 @@ class DiscoveryPageJobService:
             run_id=run_id,
             tahun=tahun,
             pages=page_rows,
+        )
+
+    def claim_pending(
+        self,
+        session: Session,
+        *,
+        worker_id: str,
+        batch_size: int = 5,
+        run_id: int | None = None,
+    ):
+        return claim_pending_page_jobs(
+            session,
+            worker_id=worker_id,
+            batch_size=batch_size,
+            run_id=run_id,
+        )
+
+    def adopt_processing(
+        self,
+        session: Session,
+        *,
+        page_job_id: int,
+        dispatch_owner_id: str,
+        worker_id: str,
+    ):
+        return adopt_processing_page_job(
+            session,
+            page_job_id=page_job_id,
+            dispatch_owner_id=dispatch_owner_id,
+            worker_id=worker_id,
         )
 
     def claim_by_id(

@@ -100,6 +100,35 @@ class PutusanWorker:
                 processing_token=processing_token,
             )
 
+    def adopt_claimed(
+        self,
+        *,
+        putusan_id: int,
+        dispatch_owner_id: str,
+        worker_id: str,
+    ) -> ClaimedPutusan | None:
+        with SessionLocal.begin() as session:
+            putusan = putusan_lifecycle_service.adopt_processing(
+                session,
+                putusan_id=putusan_id,
+                dispatch_owner_id=dispatch_owner_id,
+                worker_id=worker_id,
+            )
+
+            if putusan is None:
+                return None
+
+            if not putusan.processing_token:
+                raise RuntimeError(
+                    f"Putusan {putusan_id} adopted but processing_token kosong."
+                )
+
+            return ClaimedPutusan(
+                putusan_id=putusan.id,
+                url_detail=putusan.url_detail,
+                processing_token=putusan.processing_token,
+            )
+
     async def process_claimed(
         self,
         browser,

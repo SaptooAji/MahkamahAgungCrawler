@@ -8,9 +8,8 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 
 import nodriver as uc
-from sqlalchemy import select
+from sqlalchemy import func, select
 from celery_app.celery import celery_app
-from celery import chord
 from database.session import SessionLocal
 from scraper.detail_page import (
     DetailPageScraper,
@@ -27,7 +26,7 @@ from services.discovery_page_dispatcher import (
 from services.run_finalizer_service import RunFinalizerService
 from repositories.discovery_page_job_repository import get_run_status_counts
 from repositories.putusan_repository import get_status_counts_by_run_id
-from models.discovery_page_job import DiscoveryPageJobStatus
+from models.discovery_page_job import DiscoveryPageJob, DiscoveryPageJobStatus
 from models.putusan import Putusan, ScrapingStatus
 from services.putusan_lifecycle_service import putusan_lifecycle_service
 from models.scraping_run import ScrapingRun, ScrapingRunStatus
@@ -41,6 +40,16 @@ def get_worker_id() -> str:
     return f"{socket.gethostname()}-{os.getpid()}"
 
 
+def acquire_dispatch_lock(session, *, run_id: int, domain: str) -> None:
+    """Serialize one scheduler decision per run/domain."""
+    if run_id < 1:
+        raise ValueError("run_id harus >= 1")
+
+    base = 1_000_000_000 if domain == "discovery" else 2_000_000_000
+    key = base + run_id
+    session.execute(select(func.pg_advisory_xact_lock(key)))
+
+
 # ============================================================
 # PUTUSAN PROCESS
 # ============================================================
@@ -49,29 +58,37 @@ async def _process_putusan(
     putusan_id: int,
     worker_id: str,
     run_id: int | None = None,
+    dispatch_owner_id: str | None = None,
 ) -> dict:
     logger.info(
-        "PUTUSAN_TASK_START putusan_id=%s worker_id=%s",
+        "PUTUSAN_TASK_START putusan_id=%s worker_id=%s dispatch_owner_id=%s",
         putusan_id,
         worker_id,
+        dispatch_owner_id,
     )
 
     worker = build_putusan_worker()
 
-    # ============================================================
-    # 1. CLAIM DULU
-    # ============================================================
-
-    claimed = worker.claim(
-        putusan_id=putusan_id,
-        worker_id=worker_id,
-        run_id=run_id,
-    )
+    # A dispatcher reserves the row before enqueueing the child task.
+    # The child atomically adopts that reservation. Duplicate deliveries
+    # therefore lose the fence before any browser starts.
+    if dispatch_owner_id is not None:
+        claimed = worker.adopt_claimed(
+            putusan_id=putusan_id,
+            dispatch_owner_id=dispatch_owner_id,
+            worker_id=worker_id,
+        )
+    else:
+        claimed = worker.claim(
+            putusan_id=putusan_id,
+            worker_id=worker_id,
+            run_id=run_id,
+        )
 
     if claimed is None:
         logger.info(
             "PUTUSAN_TASK_SKIPPED "
-            "putusan_id=%s worker_id=%s reason=claim_failed",
+            "putusan_id=%s worker_id=%s reason=claim_or_adoption_failed",
             putusan_id,
             worker_id,
         )
@@ -82,7 +99,7 @@ async def _process_putusan(
             "url_detail": "",
             "url_pdf": None,
             "error_message": (
-                "Putusan tidak dapat di-claim. "
+                "Putusan tidak dapat di-claim/adopt. "
                 "Kemungkinan sudah diproses worker lain, "
                 "belum waktunya retry, atau status tidak valid."
             ),
@@ -93,10 +110,6 @@ async def _process_putusan(
         putusan_id,
         worker_id,
     )
-
-    # ============================================================
-    # 2. BARU START BROWSER
-    # ============================================================
 
     try:
         browser = await uc.start(
@@ -135,10 +148,6 @@ async def _process_putusan(
     )
 
     try:
-        # ========================================================
-        # 3. SCRAPE PUTUSAN YANG SUDAH DI-CLAIM
-        # ========================================================
-
         result = await worker.process_claimed(
             browser,
             claimed=claimed,
@@ -186,6 +195,7 @@ async def _process_putusan(
         )
         browser.stop()
 
+
 @celery_app.task(
     bind=True,
     name="putusan.dispatch_pending",
@@ -196,48 +206,63 @@ def dispatch_pending_putusan(
     run_id: int | None = None,
 ) -> dict:
     """
-    Mengirim maksimal batch_size Putusan yang siap diproses.
+    Reserve one Putusan batch atomically, then enqueue child tasks.
 
-    Dispatcher tidak melakukan claim.
-    Claim dilakukan oleh putusan.process.
-
-    Batch berikutnya hanya dijadwalkan setelah seluruh task
-    pada batch saat ini selesai.
+    This task is intentionally the only production scheduler for Putusan.
+    There is no self-chaining callback; Celery Beat is the safety-net
+    scheduler and stale-lease recovery remains DB-driven.
     """
-
-    logger.info(
-        "PUTUSAN_DISPATCH_START batch_size=%s",
-        batch_size,
-    )
-
     if batch_size < 1:
         raise ValueError("batch_size harus >= 1")
-
     if batch_size > 5:
         raise ValueError(
             "batch_size maksimal 5 untuk konfigurasi worker saat ini."
         )
-
     if run_id is None:
         raise ValueError("run_id wajib diisi untuk dispatcher Putusan.")
 
-    putusan_ids = get_pending_putusan_ids(
-        batch_size=batch_size,
-        run_id=run_id,
-    )
+    dispatch_owner_id = f"dispatch:{self.request.id}"
 
-    logger.info(
-        "PUTUSAN_DISPATCH_SELECTED "
-        "putusan_ids=%s count=%s",
-        putusan_ids,
-        len(putusan_ids),
-    )
+    with SessionLocal.begin() as session:
+        acquire_dispatch_lock(
+            session,
+            run_id=run_id,
+            domain="putusan",
+        )
+
+        active_processing = session.scalar(
+            select(func.count())
+            .select_from(Putusan)
+            .where(
+                Putusan.run_id == run_id,
+                Putusan.status_scraping == ScrapingStatus.PROCESSING,
+            )
+        ) or 0
+
+        if active_processing:
+            return {
+                "dispatched": 0,
+                "putusan_ids": [],
+                "task_ids": [],
+                "next_batch_scheduled": False,
+                "reason": "batch_already_processing",
+            }
+
+        claimed = putusan_lifecycle_service.claim(
+            session,
+            worker_id=dispatch_owner_id,
+            batch_size=batch_size,
+            run_id=run_id,
+        )
+
+        putusan_ids = [row.id for row in claimed]
 
     if not putusan_ids:
         logger.info(
-            "PUTUSAN_DISPATCH_EMPTY"
+            "PUTUSAN_DISPATCH_EMPTY run_id=%s owner=%s",
+            run_id,
+            dispatch_owner_id,
         )
-
         return {
             "dispatched": 0,
             "putusan_ids": [],
@@ -245,31 +270,32 @@ def dispatch_pending_putusan(
             "next_batch_scheduled": False,
         }
 
-    tasks = [
-        process_putusan.s(putusan_id, run_id=run_id)
-        for putusan_id in putusan_ids
-    ]
+    task_ids: list[str] = []
 
-    callback = dispatch_pending_putusan.si(
-        batch_size=batch_size,
-        run_id=run_id,
-    )
-
-    result = chord(tasks)(callback)
+    for putusan_id in putusan_ids:
+        async_result = process_putusan.delay(
+            putusan_id,
+            run_id=run_id,
+            dispatch_owner_id=dispatch_owner_id,
+        )
+        task_ids.append(async_result.id)
 
     logger.info(
-        "PUTUSAN_BATCH_SCHEDULED "
-        "putusan_ids=%s chord_id=%s",
+        "PUTUSAN_BATCH_SCHEDULED run_id=%s putusan_ids=%s "
+        "task_ids=%s owner=%s",
+        run_id,
         putusan_ids,
-        result.id,
+        task_ids,
+        dispatch_owner_id,
     )
 
     return {
         "dispatched": len(putusan_ids),
         "putusan_ids": putusan_ids,
-        "chord_id": result.id,
-        "next_batch_scheduled": True,
+        "task_ids": task_ids,
+        "next_batch_scheduled": False,
     }
+
 
 @celery_app.task(
     bind=True,
@@ -279,6 +305,7 @@ def process_putusan(
     self,
     putusan_id: int,
     run_id: int | None = None,
+    dispatch_owner_id: str | None = None,
 ) -> dict:
     worker_id = get_worker_id()
 
@@ -287,6 +314,7 @@ def process_putusan(
             putusan_id,
             worker_id,
             run_id,
+            dispatch_owner_id,
         )
     )
 
@@ -301,26 +329,14 @@ DISCOVERY_BATCH_SIZE_MAX = 5
 async def _process_discovery_page_batch(
     page_job_ids: list[int],
     worker_id: str,
+    dispatch_owner_id: str | None = None,
 ) -> dict:
-    """
-    Memproses satu batch DiscoveryPageJob secara sequential.
-
-    Invariant:
-
-    - maksimal 5 job per batch;
-    - claim dilakukan sebelum browser dimulai;
-    - satu batch menggunakan satu browser;
-    - kegagalan satu job tidak menghentikan job berikutnya.
-
-    Lifecycle status job tetap menjadi tanggung jawab
-    DiscoveryPageWorker melalui process_claimed().
-    """
-
+    """Process one reserved discovery batch sequentially in one browser."""
     logger.info(
-        "DISCOVERY_BATCH_START "
-        "page_job_ids=%s worker_id=%s",
+        "DISCOVERY_BATCH_START page_job_ids=%s worker_id=%s owner=%s",
         page_job_ids,
         worker_id,
+        dispatch_owner_id,
     )
 
     if not page_job_ids:
@@ -341,47 +357,30 @@ async def _process_discovery_page_batch(
             "Jumlah page_job_ids dalam satu batch tidak boleh lebih dari 5."
         )
 
-    scraper = DiscoveryPageScraper(
-        render_wait_seconds=5.0,
-    )
-
+    scraper = DiscoveryPageScraper(render_wait_seconds=5.0)
     worker = build_discovery_page_worker(scraper)
-
-    # ------------------------------------------------------------
-    # 1. CLAIM SEMUA JOB DULU
-    # ------------------------------------------------------------
 
     claimed_jobs = []
     skipped_ids = []
 
     for page_job_id in page_job_ids:
-        claimed = worker.claim(
-            page_job_id=page_job_id,
-            worker_id=worker_id,
-        )
-
-        if claimed is None:
-            logger.info(
-                "DISCOVERY_PAGE_SKIPPED "
-                "page_job_id=%s worker_id=%s reason=claim_failed",
-                page_job_id,
-                worker_id,
+        if dispatch_owner_id is not None:
+            claimed = worker.adopt_claimed(
+                page_job_id=page_job_id,
+                dispatch_owner_id=dispatch_owner_id,
+                worker_id=worker_id,
+            )
+        else:
+            claimed = worker.claim(
+                page_job_id=page_job_id,
+                worker_id=worker_id,
             )
 
+        if claimed is None:
             skipped_ids.append(page_job_id)
             continue
 
-        logger.info(
-            "DISCOVERY_PAGE_CLAIMED "
-            "page_job_id=%s page_number=%s worker_id=%s",
-            claimed.page_job_id,
-            claimed.page_number,
-            worker_id,
-        )
-
         claimed_jobs.append(claimed)
-
-    # Tidak ada job yang berhasil di-claim.
 
     if not claimed_jobs:
         return {
@@ -392,19 +391,12 @@ async def _process_discovery_page_batch(
             "failed": 0,
             "skipped": len(skipped_ids),
             "results": [
-                {
-                    "page_job_id": page_job_id,
-                    "status": "SKIPPED",
-                }
+                {"page_job_id": page_job_id, "status": "SKIPPED"}
                 for page_job_id in skipped_ids
             ],
             "next_batch_scheduled": False,
             "next_task_id": None,
         }
-
-    # ------------------------------------------------------------
-    # 2. BARU START SATU BROWSER
-    # ------------------------------------------------------------
 
     try:
         browser = await uc.start(
@@ -429,36 +421,19 @@ async def _process_discovery_page_batch(
                     )
                 except Exception:
                     logger.exception(
-                        "DISCOVERY_BROWSER_START_RECOVERY_FAILED "
-                        "page_job_id=%s worker_id=%s",
+                        "DISCOVERY_BROWSER_START_RECOVERY_FAILED page_job_id=%s",
                         claimed.page_job_id,
-                        worker_id,
                     )
         raise
 
-    logger.info(
-        "DISCOVERY_BROWSER_STARTED "
-        "worker_id=%s claimed_count=%s",
-        worker_id,
-        len(claimed_jobs),
-    )
-
     results = [
-        {
-            "page_job_id": page_job_id,
-            "status": "SKIPPED",
-        }
+        {"page_job_id": page_job_id, "status": "SKIPPED"}
         for page_job_id in skipped_ids
     ]
-
     success_count = 0
     failed_count = 0
 
     try:
-        # --------------------------------------------------------
-        # 3. PROCESS SEQUENTIAL DALAM SATU BROWSER
-        # --------------------------------------------------------
-
         for claimed in claimed_jobs:
             try:
                 result = await worker.process_claimed(
@@ -466,48 +441,24 @@ async def _process_discovery_page_batch(
                     claimed=claimed,
                     worker_id=worker_id,
                 )
-
                 results.append({
                     **asdict(result),
                     "status": "SUCCESS",
                 })
-
-                logger.info(
-                    "DISCOVERY_PAGE_FINISHED "
-                    "page_job_id=%s page_number=%s status=SUCCESS "
-                    "discovered_count=%s created_count=%s "
-                    "existing_count=%s worker_id=%s",
-                    claimed.page_job_id,
-                    claimed.page_number,
-                    result.discovered_count,
-                    result.created_count,
-                    result.existing_count,
-                    worker_id,
-                )
-
                 success_count += 1
-
             except Exception as exc:
                 logger.exception(
-                    "DISCOVERY_PAGE_ERROR "
-                    "page_job_id=%s page_number=%s worker_id=%s",
+                    "DISCOVERY_PAGE_ERROR page_job_id=%s page_number=%s worker_id=%s",
                     claimed.page_job_id,
                     claimed.page_number,
                     worker_id,
                 )
-
-                # process_claimed() sudah bertanggung jawab menandai
-                # job FAILED_RETRY sebelum exception dilempar kembali.
-
                 results.append({
                     "page_job_id": claimed.page_job_id,
                     "page_number": claimed.page_number,
                     "status": "FAILED_RETRY",
-                    "error_message": (
-                        f"{type(exc).__name__}: {exc}"
-                    ),
+                    "error_message": f"{type(exc).__name__}: {exc}",
                 })
-
                 failed_count += 1
 
         return {
@@ -518,69 +469,72 @@ async def _process_discovery_page_batch(
             "failed": failed_count,
             "skipped": len(skipped_ids),
             "results": results,
+            "next_batch_scheduled": False,
+            "next_task_id": None,
         }
-
     finally:
-        logger.info(
-            "DISCOVERY_BROWSER_STOP "
-            "worker_id=%s claimed_count=%s",
-            worker_id,
-            len(claimed_jobs),
-        )
-
         browser.stop()
 
 
 @celery_app.task(
     bind=True,
-    name="discovery_page.dispatch_pending",
+    name="discovery_page.dispatch_batch",
 )
 def dispatch_pending_discovery_page(
     self,
     batch_size: int = DISCOVERY_BATCH_SIZE_MAX,
     run_id: int | None = None,
 ) -> dict:
-    """
-    Memulai satu batch DiscoveryPageJob.
-
-    Dispatcher hanya memilih ID yang siap diproses.
-    Claim tetap dilakukan oleh batch worker setelah task dimulai.
-    """
-
-    logger.info(
-        "DISCOVERY_DISPATCH_START "
-        "batch_size=%s run_id=%s",
-        batch_size,
-        run_id,
-    )
-
+    """Atomically reserve one discovery batch and enqueue exactly one child task."""
     if batch_size < 1:
         raise ValueError("batch_size harus >= 1")
-
     if batch_size > DISCOVERY_BATCH_SIZE_MAX:
         raise ValueError(
             "batch_size maksimal 5 untuk konfigurasi worker saat ini."
         )
+    if run_id is None:
+        raise ValueError("run_id wajib diisi untuk dispatcher discovery.")
 
-    page_job_ids = get_pending_discovery_page_ids(
-        batch_size=batch_size,
-        run_id=run_id,
-    )
+    dispatch_owner_id = f"dispatch:{self.request.id}"
 
-    logger.info(
-        "DISCOVERY_DISPATCH_SELECTED "
-        "run_id=%s page_job_ids=%s count=%s",
-        run_id,
-        page_job_ids,
-        len(page_job_ids),
-    )
+    with SessionLocal.begin() as session:
+        acquire_dispatch_lock(
+            session,
+            run_id=run_id,
+            domain="discovery",
+        )
+
+        active_processing = session.scalar(
+            select(func.count())
+            .select_from(DiscoveryPageJob)
+            .where(
+                DiscoveryPageJob.run_id == run_id,
+                DiscoveryPageJob.status == DiscoveryPageJobStatus.PROCESSING,
+            )
+        ) or 0
+
+        if active_processing:
+            return {
+                "dispatched": 0,
+                "page_job_ids": [],
+                "task_id": None,
+                "reason": "batch_already_processing",
+            }
+
+        claimed = discovery_page_job_service.claim_pending(
+            session,
+            worker_id=dispatch_owner_id,
+            batch_size=batch_size,
+            run_id=run_id,
+        )
+        page_job_ids = [row.id for row in claimed]
 
     if not page_job_ids:
         logger.info(
-            "DISCOVERY_DISPATCH_EMPTY run_id=%s",
+            "DISCOVERY_DISPATCH_EMPTY run_id=%s owner=%s",
             run_id,
+            dispatch_owner_id,
         )
-
         return {
             "dispatched": 0,
             "page_job_ids": [],
@@ -590,14 +544,15 @@ def dispatch_pending_discovery_page(
     result = process_discovery_page_batch.delay(
         page_job_ids,
         run_id=run_id,
+        dispatch_owner_id=dispatch_owner_id,
     )
 
     logger.info(
-        "DISCOVERY_BATCH_SCHEDULED "
-        "run_id=%s page_job_ids=%s task_id=%s",
+        "DISCOVERY_BATCH_SCHEDULED run_id=%s page_job_ids=%s task_id=%s owner=%s",
         run_id,
         page_job_ids,
         result.id,
+        dispatch_owner_id,
     )
 
     return {
@@ -615,14 +570,8 @@ def process_discovery_page_batch(
     self,
     page_job_ids: list[int],
     run_id: int | None = None,
+    dispatch_owner_id: str | None = None,
 ) -> dict:
-    """
-    Celery entry point untuk satu batch.
-
-    Setelah batch selesai, satu batch berikutnya dijadwalkan
-    otomatis jika masih ada DiscoveryPageJob yang pending.
-    """
-
     if not page_job_ids:
         return {
             "requested": 0,
@@ -641,62 +590,13 @@ def process_discovery_page_batch(
             "Satu batch maksimal berisi 5 DiscoveryPageJob."
         )
 
-    worker_id = get_worker_id()
-
-    logger.info(
-        "DISCOVERY_BATCH_TASK_START "
-        "run_id=%s page_job_ids=%s worker_id=%s",
-        run_id,
-        page_job_ids,
-        worker_id,
-    )
-
-    result = asyncio.run(
+    return asyncio.run(
         _process_discovery_page_batch(
             page_job_ids,
-            worker_id,
+            get_worker_id(),
+            dispatch_owner_id,
         )
     )
-
-    # ------------------------------------------------------------
-    # AUTOMATIC NEXT BATCH
-    # ------------------------------------------------------------
-
-    next_page_job_ids = get_pending_discovery_page_ids(
-        batch_size=DISCOVERY_BATCH_SIZE_MAX,
-        run_id=run_id,
-    )
-
-    if next_page_job_ids:
-        next_task = process_discovery_page_batch.delay(
-            next_page_job_ids,
-            run_id=run_id,
-        )
-
-        logger.info(
-            "DISCOVERY_NEXT_BATCH_SCHEDULED "
-            "run_id=%s page_job_ids=%s task_id=%s worker_id=%s",
-            run_id,
-            next_page_job_ids,
-            next_task.id,
-            worker_id,
-        )
-
-        result["next_batch_scheduled"] = True
-        result["next_task_id"] = next_task.id
-
-    else:
-        logger.info(
-            "DISCOVERY_BATCH_CHAIN_COMPLETE "
-            "run_id=%s worker_id=%s",
-            run_id,
-            worker_id,
-        )
-
-        result["next_batch_scheduled"] = False
-        result["next_task_id"] = None
-
-    return result
 
 
 @celery_app.task(
@@ -1104,8 +1004,8 @@ def maintenance_tick() -> dict:
                 run_id=run_id,
             )
             if page_ids:
-                task = process_discovery_page_batch.delay(
-                    page_ids,
+                task = dispatch_pending_discovery_page.delay(
+                    batch_size=5,
                     run_id=run_id,
                 )
                 scheduled_discovery.append({

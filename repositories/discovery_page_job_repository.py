@@ -118,6 +118,77 @@ def create_page_jobs(
 
     return len(created_ids)
 
+def claim_pending_page_jobs(
+    session: Session,
+    *,
+    worker_id: str,
+    batch_size: int = 5,
+    run_id: int | None = None,
+) -> list[DiscoveryPageJob]:
+    """Atomically reserve an eligible discovery-page batch for one task owner."""
+    if batch_size < 1:
+        raise ValueError("batch_size harus >= 1")
+
+    now = datetime.now(timezone.utc)
+    stmt = (
+        select(DiscoveryPageJob)
+        .where(
+            DiscoveryPageJob.status.in_([
+                DiscoveryPageJobStatus.PENDING,
+                DiscoveryPageJobStatus.FAILED_RETRY,
+            ]),
+            (
+                DiscoveryPageJob.next_retry_at.is_(None)
+                | (DiscoveryPageJob.next_retry_at <= now)
+            ),
+        )
+        .order_by(DiscoveryPageJob.id)
+        .limit(batch_size)
+        .with_for_update(skip_locked=True)
+    )
+
+    if run_id is not None:
+        stmt = stmt.where(DiscoveryPageJob.run_id == run_id)
+
+    page_jobs = list(session.scalars(stmt).all())
+
+    for page_job in page_jobs:
+        page_job.status = DiscoveryPageJobStatus.PROCESSING
+        page_job.processing_started_at = now
+        page_job.processing_worker_id = worker_id
+        page_job.processing_token = str(uuid4())
+        page_job.next_retry_at = None
+
+    session.flush()
+    return page_jobs
+
+
+def adopt_processing_page_job(
+    session: Session,
+    *,
+    page_job_id: int,
+    dispatch_owner_id: str,
+    worker_id: str,
+) -> DiscoveryPageJob | None:
+    """Fence duplicate Celery deliveries and transfer the lease to the worker."""
+    page_job = session.scalar(
+        select(DiscoveryPageJob)
+        .where(
+            DiscoveryPageJob.id == page_job_id,
+            DiscoveryPageJob.status == DiscoveryPageJobStatus.PROCESSING,
+            DiscoveryPageJob.processing_worker_id == dispatch_owner_id,
+            DiscoveryPageJob.processing_token.is_not(None),
+        )
+        .with_for_update(skip_locked=True)
+    )
+
+    if page_job is None:
+        return None
+
+    page_job.processing_worker_id = worker_id
+    session.flush()
+    return page_job
+
 def claim_page_job_by_id(
     session: Session,
     *,
